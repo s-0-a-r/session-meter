@@ -15,13 +15,18 @@ function stubSession(on: any, files: Files = {}) {
   mock.env(on, { HOME: '/home/test' })
   const clock = mock.clock(on, { now: 1_000_000 })
   on('session.start', () => ({ cwd: '/work' }))
-  on('session.id', () => ({ value: SID }))
+  const id = { value: SID }
+  on('session.id', () => ({ value: id.value }))
   on('session.model', () => ({ value: 'claude-test' }))
   on('session.repo', () => ({ value: { root: '/work/repo', remote: null, internal: false } }))
   on('session.usage', () => ({
     value: { startedAt: 0, context: { tokens: 1000, window: 1000000, breakdown: { autoCompactThreshold: 320000, autocompactSource: 'env' } }, rateLimits: [] },
   }))
-  on('settings.read', () => ({ value: { effortLevel: 'high' } }))
+  const counts = { settingsRead: 0 }
+  on('settings.read', () => {
+    counts.settingsRead++
+    return { value: { effortLevel: 'high' } }
+  })
   on('process.run', ($: any, e: any) => {
     runs.push(e.argv ?? e.command ?? e)
     return { value: { exitCode: 0, stdout: 'main\n', stderr: '' } }
@@ -33,8 +38,10 @@ function stubSession(on: any, files: Files = {}) {
       .filter(([p]) => p.startsWith(e.path + '/'))
       .map(([p, f]) => ({ name: p.slice(e.path.length + 1), kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs ?? Date.now(), isLink: false })),
   }))
+  const writes: { path: string; text: string }[] = []
   on('fs.write', ($: any, e: any) => {
     written.push(e.text)
+    writes.push({ path: e.path, text: e.text })
     return { value: undefined }
   })
   on('command.register', () => ({ value: undefined }))
@@ -42,7 +49,7 @@ function stubSession(on: any, files: Files = {}) {
   on('ui.invalidate', () => ({ value: undefined }))
   on('turn.complete', () => ({ text: '' }))
   on('session.end', ($: any, e: any) => ({ sessionId: e.sessionId }))
-  return { written, runs, clock }
+  return { written, writes, runs, clock, id, counts }
 }
 
 function lastRows(written: string[]) {
@@ -199,4 +206,85 @@ test('/metrics prune は古いファイルだけを絶対パスで消し、日�
 
   expect(await metrics($, 'prune 30d')).toContain('1 件')
   expect(runs.at(-1)).toEqual(['rm', '--', DIR + '/' + OTHER + '.jsonl'])
+})
+
+test('最初の応答より前でも、起動した時点で start 行が書き出される', async ($, on) => {
+  const { written } = stubSession(on)
+  await start($)
+  expect(lastRows(written).map((r) => r.t)).toEqual(['start'])
+})
+
+test('読み込み直しでは、最後のメインの応答の effort を引き継ぐ', async ($, on) => {
+  const { counts } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }, { at: 2, t: 'step', effort: 'max', in: 0, out: 0, cacheRead: 0, cacheWrite: 0 }]) } })
+  await start($)
+  expect(counts.settingsRead).toBe(0)
+})
+
+test('/clear のあとは、新しい session id のファイルに書く', async ($, on) => {
+  const { writes, id } = stubSession(on)
+  stubStep(on)
+  await start($)
+  id.value = OTHER
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  await step($)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+
+  const old = writes.filter((w) => w.path.endsWith(SID + '.jsonl')).at(-1)!
+  const fresh = writes.filter((w) => w.path.endsWith(OTHER + '.jsonl')).at(-1)!
+  expect(old.text).toContain('"t":"end"')
+  expect(old.text).not.toContain('"t":"step"')
+  expect(fresh.text).toContain('"t":"start"')
+  expect(fresh.text).toContain('"t":"step"')
+})
+
+test('5h 枠がこの速さだとリセット前に 100% を超えるとき、pace の行を1回だけ書く', async ($, on) => {
+  const { written, clock } = stubSession(on)
+  on('session.measure', () => ({ changed: ['rateLimits'] }))
+  const resetsAt = new Date(clock.now() + 4 * 3_600_000).toISOString()
+  const measure = (pct: number) => $.session.measure({ context: { tokens: 1000, window: 1000000 }, rateLimits: [{ kind: 'five_hour', percentUsed: pct, resetsAt }], changed: ['rateLimits'] } as any)
+  await start($)
+  await measure(10)
+  await clock.advance(5 * 60_000)
+  await measure(20)
+  await clock.advance(15 * 60_000)
+  await measure(30)
+  await measure(31)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+
+  const paces = lastRows(written).filter((r) => r.t === 'pace')
+  expect(paces.length).toBe(1)
+  expect(paces[0].projected).toBeGreaterThanOrEqual(100)
+})
+
+test('ゆっくり使っているときは pace の行を書かない', async ($, on) => {
+  const { written, clock } = stubSession(on)
+  on('session.measure', () => ({ changed: ['rateLimits'] }))
+  const resetsAt = new Date(clock.now() + 4 * 3_600_000).toISOString()
+  const measure = (pct: number) => $.session.measure({ context: { tokens: 1000, window: 1000000 }, rateLimits: [{ kind: 'five_hour', percentUsed: pct, resetsAt }], changed: ['rateLimits'] } as any)
+  await start($)
+  await measure(10)
+  await clock.advance(20 * 60_000)
+  await measure(11)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+
+  expect(lastRows(written).some((r) => r.t === 'pace')).toBe(false)
+})
+
+test('/metrics 7d は、期間より前に起動したセッションのリポジトリ名とエージェントの種類も引ける', async ($, on) => {
+  const now = Date.now()
+  stubSession(on, {
+    [DIR + '/' + OTHER + '.jsonl']: {
+      text: jsonl([
+        { at: now - 10 * DAY, t: 'start', repo: 'old-repo' },
+        { at: now - 10 * DAY, t: 'spawn', type: 'Plan', agentId: 'p1', model: 'claude-test' },
+        { at: now - DAY, t: 'step', in: 5, out: 0, cacheRead: 0, cacheWrite: 0 },
+        { at: now - DAY, t: 'step', agentId: 'p1', in: 3, out: 0, cacheRead: 0, cacheWrite: 0 },
+      ]),
+    },
+  })
+  await start($)
+  const text = await metrics($, '7d')
+  expect(text).toContain('old-repo: 1 リクエスト')
+  expect(text).toContain('Plan [test]')
+  expect(text).not.toContain('(不明)')
 })

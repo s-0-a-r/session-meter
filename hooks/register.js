@@ -31,8 +31,11 @@ let limits = [];
 let crossed = {};
 // 5h 枠のペース予測用。resetsAt ごとに、最初に見た時刻と使用率（メモリにだけ持つ）
 let pace = {};
-// 経過時間を描き直すタイマー
-let ticker = null;
+// 帯に出す予測（%）。100% に届かないときは null
+let projected = null;
+// 帯の描画のたびに全行を走査しないよう、最後のメインの応答時刻と圧縮回数を持つ
+let lastMainAt = null;
+let compactCount = 0;
 
 export function register(on) {
   on("session.start", async ($, e, next) => {
@@ -81,7 +84,10 @@ export function register(on) {
         // tokensBefore は core が記録しなかったときだけ無い。そのときはメインループに限り直前の計測で補う
         const tokens = r.tokensBefore ?? before?.context?.tokens ?? null;
         push({ t: "compact", trigger: e.trigger, agentId: e.agentId, tokens, after: r.tokensAfter, threshold: info.threshold });
-        if (!e.agentId && r.tokensAfter != null) ctx.tokens = r.tokensAfter;
+        if (!e.agentId) {
+          compactCount++;
+          if (r.tokensAfter != null) ctx.tokens = r.tokensAfter;
+        }
         $.ui.invalidate("ui.render");
         // /compact はターンではなく turn.complete が来ないので、ここで書き出す
         await flush($);
@@ -93,8 +99,10 @@ export function register(on) {
   }).catch(fail);
 
   on("session.measure", async ($, e, next) => {
+    const now = await $.clock.now();
     ctx = { tokens: e.context?.tokens ?? 0, window: e.context?.window ?? 0 };
     limits = e.rateLimits ?? [];
+    projected = null;
     for (const l of limits) {
       const key = l.kind + "@" + (l.resetsAt ?? "");
       const line = Math.floor(l.percentUsed / 10) * 10;
@@ -102,8 +110,13 @@ export function register(on) {
         crossed[key] = line;
         push({ t: "ratelimit", kind: l.kind, percentUsed: l.percentUsed, line, resetsAt: l.resetsAt });
       }
-      if (l.kind === "five_hour" && l.resetsAt && !pace[l.resetsAt]) {
-        pace[l.resetsAt] = { at: Date.now(), pct: l.percentUsed };
+      if (l.kind === "five_hour" && l.resetsAt) {
+        const first = pace[l.resetsAt] ?? (pace[l.resetsAt] = { at: now, pct: l.percentUsed, warned: false });
+        projected = projection(first, l, now);
+        if (projected !== null && !first.warned) {
+          first.warned = true;
+          push({ t: "pace", kind: l.kind, percentUsed: l.percentUsed, projected, resetsAt: l.resetsAt });
+        }
       }
     }
     $.ui.invalidate("ui.render");
@@ -112,9 +125,8 @@ export function register(on) {
 
   on("turn.complete", async ($, e, next) => {
     const r = await next(e);
-    if (!e.agentId) {
-      await flush($);
-    }
+    // サブエージェントだけが動いている間も書き出す（dirty でなければ何もしない）
+    await flush($);
     return r;
   }).catch(fail);
 
@@ -122,7 +134,13 @@ export function register(on) {
     const start = rows.find((r) => r.t === "start");
     push({ t: "end", reason: e.reason, durationMs: start ? Date.now() - start.at : undefined });
     await flush($);
-    return next(e);
+    const r = await next(e);
+    // /clear と resume ではプロセスが別の session id で続き、session.start は来ない。
+    // ここで記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる
+    if (e.reason === "clear" || e.reason === "resume") {
+      await setup($);
+    }
+    return r;
   }).catch(fail);
 
   on("command.run", { command: "metrics" }, async ($, e) => {
@@ -170,6 +188,9 @@ async function setup($) {
   rows = [];
   crossed = {};
   capped = false;
+  lastMainAt = null;
+  compactCount = 0;
+  let restoredEffort;
   if (await $.fs.exists(file)) {
     for (const row of parseRows(await $.fs.read(file))) {
       rows.push(row);
@@ -178,6 +199,11 @@ async function setup($) {
         crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
       }
       if (row.t === "capped") capped = true;
+      if (row.t === "step" && !row.agentId) {
+        lastMainAt = row.at;
+        if (row.effort !== undefined) restoredEffort = row.effort;
+      }
+      if (row.t === "compact" && !row.agentId) compactCount++;
     }
   }
 
@@ -196,7 +222,9 @@ async function setup($) {
   info.model = await $.session.model();
   // effort はセッション単位で読む API がないので、最初の応答までは settings の値を出す。
   // 応答が来たら turn.step の e.effort（/effort での変更も反映される）で上書きする
-  if (info.effort === null) {
+  if (restoredEffort !== undefined) {
+    info.effort = restoredEffort;
+  } else {
     const settings = await $.settings.read();
     info.effort = settings.modelSettings?.[info.model]?.effortLevel ?? settings.effortLevel ?? null;
   }
@@ -217,9 +245,11 @@ async function setup($) {
     push({ t: "start", model: info.model, repo: info.repoName, threshold: info.threshold, source: info.source });
   }
 
-  // 「前回 Nm」を進めるため、1分ごとに描き直す
-  if (ticker) ticker.cancel();
-  ticker = $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
+  // 最初の応答より前に読み込み直されても start 行が残るよう、ここで書き出す
+  await flush($);
+
+  // 「前回 Nm」を進めるため、1分ごとに描き直す。読み込み直すと古いタイマーは host が取り消す
+  $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
 
   $.ui.invalidate("ui.render");
 }
@@ -239,10 +269,11 @@ function recordStep($, e, r) {
       cacheWrite: u?.cache_creation_input_tokens ?? 0,
       advisor: advisor || undefined,
     });
-    if (!e.agentId && e.effort !== undefined && e.effort !== info.effort) {
-      info.effort = e.effort;
+    if (!e.agentId) {
+      if (e.effort !== undefined) info.effort = e.effort;
+      lastMainAt = Date.now();
+      $.ui.invalidate("ui.render");
     }
-    if (!e.agentId) $.ui.invalidate("ui.render");
   } catch {
     // 記録に失敗しても、モデルの応答はそのまま通す
   }
@@ -294,20 +325,26 @@ async function metricFiles($) {
 async function period($, days) {
   const since = Date.now() - days * DAY;
   const all = [];
+  // 期間より前に起動したセッションやエージェントも、リポジトリ名と種類は引けるようにする
+  const repoOf = {};
+  const spawnOf = {};
+  const take = (list, sid) => {
+    for (const row of list) {
+      if (row.t === "start") repoOf[sid] = row.repo || "(リポジトリ外)";
+      if (row.t === "spawn" && row.agentId) spawnOf[row.agentId] = row;
+      if (row.at >= since) all.push({ ...row, sid });
+    }
+  };
   for (const f of await metricFiles($)) {
     const sid = f.name.replace(/\.jsonl$/, "");
     // いまのセッションは、まだ書き出していない行があるのでメモリから取る
     if (sid === sessionId) continue;
     if (f.mtimeMs < since) continue;
-    for (const row of parseRows(await $.fs.read(dir + "/" + f.name))) {
-      if (row.at >= since) all.push({ ...row, sid });
-    }
+    take(parseRows(await $.fs.read(dir + "/" + f.name)), sid);
   }
-  for (const row of rows) {
-    if (row.at >= since) all.push({ ...row, sid: sessionId });
-  }
+  take(rows, sessionId);
   const sessions = new Set(all.map((r) => r.sid)).size;
-  return "直近 " + days + " 日（" + sessions + " セッション）\n" + report(all, { byRepo: true });
+  return "直近 " + days + " 日（" + sessions + " セッション）\n" + report(all, { byRepo: true, repoOf, spawnOf });
 }
 
 async function prune($, arg) {
@@ -335,7 +372,7 @@ function summary() {
 function report(list, opts = {}) {
   const steps = list.filter((r) => r.t === "step");
   const spawns = list.filter((r) => r.t === "spawn");
-  const spawnOf = {};
+  const spawnOf = { ...opts.spawnOf };
   for (const s of spawns) if (s.agentId) spawnOf[s.agentId] = s;
   const isMain = (r) => !r.agentId;
   const lines = [];
@@ -352,7 +389,7 @@ function report(list, opts = {}) {
   lines.push("メインループ: " + main.length + " リクエスト, " + fmt(sum(main)) + ", " + cacheText(main, rebuilt));
 
   if (opts.byRepo) {
-    const repoOf = {};
+    const repoOf = { ...opts.repoOf };
     for (const r of list) if (r.t === "start") repoOf[r.sid] = r.repo || "(リポジトリ外)";
     const byRepo = group(main, (r) => repoOf[r.sid] ?? "(不明)");
     if (Object.keys(byRepo).length) {
@@ -463,23 +500,19 @@ function band(Box, Text, columns) {
     const pctUsed = Math.round(l.percentUsed);
     const left = resetIn(l.resetsAt);
     meter.push({ text: name + " " + pctUsed + "%" + (left ? " (" + left + ")" : ""), color: pctUsed >= 80 ? "red" : pctUsed >= 50 ? "yellow" : undefined, dim: pctUsed < 50 });
-    const projected = l.kind === "five_hour" ? projection(l) : null;
-    if (projected !== null) meter.push({ text: "→ 予測 " + projected + "%", color: "red" });
+    if (l.kind === "five_hour" && projected !== null) meter.push({ text: "→ 予測 " + projected + "%", color: "red" });
   }
-  const last = [...rows].reverse().find((r) => r.t === "step" && !r.agentId);
-  if (last) meter.push({ text: "前回 " + (ago(last.at) || "今"), dim: true });
-  meter.push({ text: "圧縮 " + rows.filter((r) => r.t === "compact" && !r.agentId).length, dim: true });
+  if (lastMainAt) meter.push({ text: "前回 " + (ago(lastMainAt) || "今"), dim: true });
+  meter.push({ text: "圧縮 " + compactCount, dim: true });
 
   return Box({ flexDirection: "column", paddingX: 1, children: [line(Text, head, columns), line(Text, meter, columns)] });
 }
 
 // 5h 枠をこのままの速さで使うと、リセット時に何 % になるか。100% に届くときだけ返す。
 // 最初の観測から10分たつまでは、速さが当てにならないので出さない
-function projection(l) {
-  const first = pace[l.resetsAt];
+function projection(first, l, now) {
   const reset = Date.parse(l.resetsAt);
-  const now = Date.now();
-  if (!first || !(reset > now) || now - first.at < 600_000) return null;
+  if (!(reset > now) || now - first.at < 600_000) return null;
   const rate = (l.percentUsed - first.pct) / (now - first.at);
   if (!(rate > 0)) return null;
   const projected = Math.round(l.percentUsed + rate * (reset - now));
