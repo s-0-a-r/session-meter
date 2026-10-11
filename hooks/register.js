@@ -1,4 +1,4 @@
-// session-meter: セッションの計測を JSONL に残し、プロンプトの上に1行出す。
+// session-meter: セッションの計測を JSONL に残し、プロンプトの上に2行出す。
 //
 // どの hook も記録するだけで、Claude Code の判断や入力は変えない。失敗した
 // hook は .catch で「無かったもの」にし、本来の動作をそのまま進める。
@@ -7,11 +7,19 @@
 // メインループの turn.complete と session.end でファイル全体を書き直す。
 // 保存するたびに module が読み込み直されるので、session.start でファイル
 // から行を読み戻す（圧縮の回数も行から数え直す）。
+//
+// /metrics            このセッションの集計
+// /metrics 7d         直近7日の全セッションの集計
+// /metrics prune 30d  更新から30日を過ぎた記録ファイルを消す（手で呼んだときだけ）
 
-const MAX_ROWS = 5000;
+const MAX_ROWS = 20000;
+const FILE_NAME = /^[0-9a-f-]{36}\.jsonl$/;
+const DAY = 86_400_000;
 
 let rows = [];
 let file = null;
+let dir = null;
+let sessionId = null;
 let dirty = false;
 let capped = false;
 
@@ -21,6 +29,10 @@ let ctx = { tokens: 0, window: 0 };
 let limits = [];
 // 利用枠ごとに、記録済みの一番高い 10 ポイント刻みの線
 let crossed = {};
+// 5h 枠のペース予測用。resetsAt ごとに、最初に見た時刻と使用率（メモリにだけ持つ）
+let pace = {};
+// 経過時間を描き直すタイマー
+let ticker = null;
 
 export function register(on) {
   on("session.start", async ($, e, next) => {
@@ -38,6 +50,18 @@ export function register(on) {
   on("agent.spawn", async ($, e, next) => {
     const r = await next(e);
     push({ t: "spawn", type: e.subagentType, agentId: r.agentId, model: r.model, denied: r.deny ? true : undefined });
+    return r;
+  }).catch(fail);
+
+  on("tool.call", async ($, e, next) => {
+    const started = await $.clock.now();
+    const r = await next(e);
+    try {
+      const ms = (await $.clock.now()) - started;
+      push({ t: "tool", name: e.tool, agentId: e.agentId, ms, err: r.isError ? true : undefined, deny: r.deny ? true : undefined });
+    } catch {
+      // 記録に失敗しても、ツールの結果はそのまま返す
+    }
     return r;
   }).catch(fail);
 
@@ -78,6 +102,9 @@ export function register(on) {
         crossed[key] = line;
         push({ t: "ratelimit", kind: l.kind, percentUsed: l.percentUsed, line, resetsAt: l.resetsAt });
       }
+      if (l.kind === "five_hour" && l.resetsAt && !pace[l.resetsAt]) {
+        pace[l.resetsAt] = { at: Date.now(), pct: l.percentUsed };
+      }
     }
     $.ui.invalidate("ui.render");
     return next(e);
@@ -92,11 +119,22 @@ export function register(on) {
   }).catch(fail);
 
   on("session.end", async ($, e, next) => {
+    const start = rows.find((r) => r.t === "start");
+    push({ t: "end", reason: e.reason, durationMs: start ? Date.now() - start.at : undefined });
     await flush($);
     return next(e);
   }).catch(fail);
 
   on("command.run", { command: "metrics" }, async ($, e) => {
+    const args = (e.args ?? "").trim().split(/\s+/).filter(Boolean);
+    if (args[0] === "prune") {
+      return { text: await prune($, args[1]) };
+    }
+    if (args[0]) {
+      const days = parseDays(args[0]);
+      if (!days) return { text: USAGE };
+      return { text: await period($, days) };
+    }
     return { text: summary() };
   }).catch(fail);
 
@@ -108,6 +146,8 @@ export function register(on) {
     return band(Box, Text, e.props?.bodyColumns ?? 80);
   }).catch(fail);
 }
+
+const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（直近7日） / /metrics prune 30d（30日より前の記録ファイルを消す）";
 
 // 失敗した hook は無かったものにする（undefined を返す）。理由だけ transcript に薄く残す
 function fail($, e, next) {
@@ -122,33 +162,27 @@ async function* failStream($, e, next) {
 }
 
 async function setup($) {
-  const id = await $.session.id();
+  sessionId = await $.session.id();
   const home = await $.env.get("HOME");
-  file = home + "/.claude/mod-metrics/" + id + ".jsonl";
+  dir = home + "/.claude/mod-metrics";
+  file = dir + "/" + sessionId + ".jsonl";
 
   rows = [];
   crossed = {};
   capped = false;
   if (await $.fs.exists(file)) {
-    const text = await $.fs.read(file);
-    for (const line of String(text).split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const row = JSON.parse(line);
-        rows.push(row);
-        if (row.t === "ratelimit") {
-          const key = row.kind + "@" + (row.resetsAt ?? "");
-          crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
-        }
-        if (row.t === "capped") capped = true;
-      } catch {
-        // 壊れた行は読み飛ばす
+    for (const row of parseRows(await $.fs.read(file))) {
+      rows.push(row);
+      if (row.t === "ratelimit") {
+        const key = row.kind + "@" + (row.resetsAt ?? "");
+        crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
       }
+      if (row.t === "capped") capped = true;
     }
   }
 
   try {
-    await $.command.register({ name: "metrics", description: "このセッションの計測（圧縮・cache・エージェント別・advisor）を表示する" });
+    await $.command.register({ name: "metrics", description: "計測の集計（引数なし: このセッション、7d: 直近7日、prune 30d: 古い記録を消す）" });
   } catch {
     // 読み込み直しで登録済みのときもここに来る
   }
@@ -176,7 +210,17 @@ async function setup($) {
     // git がない、リポジトリ外など
   }
 
-  push({ t: "start", model: info.model, repo: info.repoName, threshold: info.threshold, source: info.source });
+  // 読み込み直しでは start を重ねず、reload の行だけ残す
+  if (rows.some((r) => r.t === "start")) {
+    push({ t: "reload" });
+  } else {
+    push({ t: "start", model: info.model, repo: info.repoName, threshold: info.threshold, source: info.source });
+  }
+
+  // 「前回 Nm」を進めるため、1分ごとに描き直す
+  if (ticker) ticker.cancel();
+  ticker = $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
+
   $.ui.invalidate("ui.render");
 }
 
@@ -197,8 +241,8 @@ function recordStep($, e, r) {
     });
     if (!e.agentId && e.effort !== undefined && e.effort !== info.effort) {
       info.effort = e.effort;
-      $.ui.invalidate("ui.render");
     }
+    if (!e.agentId) $.ui.invalidate("ui.render");
   } catch {
     // 記録に失敗しても、モデルの応答はそのまま通す
   }
@@ -222,8 +266,185 @@ async function flush($) {
   await $.fs.write(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
 }
 
-function compactions() {
-  return rows.filter((r) => r.t === "compact" && !r.agentId);
+function parseRows(text) {
+  const out = [];
+  for (const line of String(text).split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line));
+    } catch {
+      // 壊れた行は読み飛ばす
+    }
+  }
+  return out;
+}
+
+function parseDays(arg) {
+  const m = /^(\d+)d$/.exec(arg ?? "");
+  return m && Number(m[1]) > 0 ? Number(m[1]) : null;
+}
+
+// 記録ファイルの一覧（名前が session id のものだけ）
+async function metricFiles($) {
+  if (!dir || !(await $.fs.exists(dir))) return [];
+  const entries = await $.fs.list(dir);
+  return entries.filter((f) => f.kind === "file" && FILE_NAME.test(f.name));
+}
+
+async function period($, days) {
+  const since = Date.now() - days * DAY;
+  const all = [];
+  for (const f of await metricFiles($)) {
+    const sid = f.name.replace(/\.jsonl$/, "");
+    // いまのセッションは、まだ書き出していない行があるのでメモリから取る
+    if (sid === sessionId) continue;
+    if (f.mtimeMs < since) continue;
+    for (const row of parseRows(await $.fs.read(dir + "/" + f.name))) {
+      if (row.at >= since) all.push({ ...row, sid });
+    }
+  }
+  for (const row of rows) {
+    if (row.at >= since) all.push({ ...row, sid: sessionId });
+  }
+  const sessions = new Set(all.map((r) => r.sid)).size;
+  return "直近 " + days + " 日（" + sessions + " セッション）\n" + report(all, { byRepo: true });
+}
+
+async function prune($, arg) {
+  const days = parseDays(arg);
+  if (!days) return USAGE;
+  const before = Date.now() - days * DAY;
+  const old = (await metricFiles($)).filter((f) => f.mtimeMs < before && f.name !== sessionId + ".jsonl");
+  if (!old.length) return days + " 日より前の記録ファイルはありません";
+  const r = await $.process.run(["rm", "--", ...old.map((f) => dir + "/" + f.name)], { timeoutMs: 10000 });
+  if (r.exitCode !== 0) return "削除に失敗しました: " + r.stderr.trim();
+  const bytes = old.reduce((a, f) => a + f.size, 0);
+  return days + " 日より前の記録ファイルを " + old.length + " 件（" + short(bytes) + "B）消しました";
+}
+
+function summary() {
+  const all = rows.map((r) => ({ ...r, sid: sessionId }));
+  const lines = [report(all, { rateLimits: true })];
+  lines.push("閾値: " + (info.threshold ? short(info.threshold) + "（" + info.source + "）" : "取得できず"));
+  if (capped) lines.push("記録は " + MAX_ROWS + " 行で打ち切り済み");
+  lines.push("記録: " + (file ?? "(未設定)"));
+  return lines.join("\n");
+}
+
+// 行の配列（sid 付き）から集計を作る。このセッション用と期間集計で共通
+function report(list, opts = {}) {
+  const steps = list.filter((r) => r.t === "step");
+  const spawns = list.filter((r) => r.t === "spawn");
+  const spawnOf = {};
+  for (const s of spawns) if (s.agentId) spawnOf[s.agentId] = s;
+  const isMain = (r) => !r.agentId;
+  const lines = [];
+
+  const comp = list.filter((r) => r.t === "compact" && isMain(r));
+  const auto = comp.filter((c) => c.trigger === "auto").length;
+  lines.push("圧縮: " + comp.length + " 回" + (comp.length ? "（auto " + auto + " / manual " + (comp.length - auto) + "）" : ""));
+  if (comp.length && !opts.byRepo) {
+    lines.push("  " + comp.map((c) => short(c.tokens ?? 0) + (c.after != null ? "→" + short(c.after) : "") + " " + c.trigger).join(", "));
+  }
+
+  const rebuilt = rebuilds(list);
+  const main = steps.filter(isMain);
+  lines.push("メインループ: " + main.length + " リクエスト, " + fmt(sum(main)) + ", " + cacheText(main, rebuilt));
+
+  if (opts.byRepo) {
+    const repoOf = {};
+    for (const r of list) if (r.t === "start") repoOf[r.sid] = r.repo || "(リポジトリ外)";
+    const byRepo = group(main, (r) => repoOf[r.sid] ?? "(不明)");
+    if (Object.keys(byRepo).length) {
+      lines.push("リポジトリ別（メインループ）:");
+      for (const [repo, l] of sorted(byRepo, (l) => total(sum(l)))) {
+        lines.push("  " + repo + ": " + l.length + " リクエスト, " + short(total(sum(l))) + " tokens");
+      }
+    }
+  }
+
+  // エージェントの種類とモデルごと
+  const keyOf = (s) => (s.type ?? "(不明)") + (s.model ? " [" + s.model.replace(/^claude-/, "") + "]" : "");
+  const byKey = group(steps.filter((r) => r.agentId), (r) => (spawnOf[r.agentId] ? keyOf(spawnOf[r.agentId]) : "(不明)"));
+  const counts = {};
+  for (const s of spawns) counts[keyOf(s)] = (counts[keyOf(s)] ?? 0) + 1;
+  const keys = Object.keys({ ...byKey, ...counts });
+  if (keys.length) {
+    lines.push("サブエージェント:");
+    for (const key of keys.sort((a, b) => total(sum(byKey[b] ?? [])) - total(sum(byKey[a] ?? [])))) {
+      const l = byKey[key] ?? [];
+      const n = counts[key] ?? 0;
+      const avg = n ? ", 1回あたり " + short(Math.round(total(sum(l)) / n)) : "";
+      lines.push("  " + key + ": 起動 " + n + " 回" + avg + ", " + fmt(sum(l)) + ", " + cacheText(l, rebuilt));
+    }
+  }
+
+  const adv = (l) => l.reduce((a, r) => a + (r.advisor ?? 0), 0);
+  lines.push("advisor: メイン " + adv(main) + " 回 / サブエージェント " + adv(steps.filter((r) => r.agentId)) + " 回");
+
+  const tools = list.filter((r) => r.t === "tool");
+  if (tools.length) {
+    lines.push("ツール（合計時間の長い順、上位10）:");
+    for (const [name, l] of sorted(group(tools, (r) => r.name), (l) => l.reduce((a, r) => a + (r.ms ?? 0), 0)).slice(0, 10)) {
+      const errs = l.filter((r) => r.err || r.deny).length;
+      lines.push("  " + name + ": " + l.length + " 回" + (errs ? "（失敗 " + errs + "）" : "") + ", 合計 " + duration(l.reduce((a, r) => a + (r.ms ?? 0), 0)));
+    }
+  }
+
+  if (opts.rateLimits) {
+    const rl = list.filter((r) => r.t === "ratelimit");
+    if (rl.length) lines.push("利用枠の線越え: " + rl.map((r) => r.kind + " " + r.line + "%").join(", "));
+  }
+  return lines.join("\n");
+}
+
+// cache を作り直したリクエスト。同じループ（セッションのメインか、サブエージェント）の
+// 2回目以降で、cacheWrite が cacheRead を上回ったもの。初回と圧縮直後は書き込むのが当然なので除く
+function rebuilds(list) {
+  const seen = new Set();
+  const out = new Set();
+  for (const r of list) {
+    const loop = r.agentId ?? "main:" + r.sid;
+    if (r.t === "compact") {
+      seen.delete(loop);
+      continue;
+    }
+    if (r.t !== "step") continue;
+    if (seen.has(loop) && r.cacheWrite > r.cacheRead) out.add(r);
+    seen.add(loop);
+  }
+  return out;
+}
+
+function cacheText(steps, rebuilt) {
+  const t = sum(steps);
+  const input = t.in + t.cacheRead + t.cacheWrite;
+  const n = steps.filter((r) => rebuilt.has(r)).length;
+  return "cache から " + (input ? Math.round((t.cacheRead / input) * 100) : 0) + "%" + (n ? "（作り直し " + n + " 回）" : "");
+}
+
+function sum(list) {
+  return list.reduce((a, r) => ({
+    in: a.in + (r.in ?? 0), out: a.out + (r.out ?? 0), cacheRead: a.cacheRead + (r.cacheRead ?? 0), cacheWrite: a.cacheWrite + (r.cacheWrite ?? 0),
+  }), { in: 0, out: 0, cacheRead: 0, cacheWrite: 0 });
+}
+
+function total(t) {
+  return t.in + t.out + t.cacheRead + t.cacheWrite;
+}
+
+function fmt(t) {
+  return "in " + short(t.in) + " / out " + short(t.out) + " / cache read " + short(t.cacheRead) + " / cache write " + short(t.cacheWrite);
+}
+
+function group(list, keyFn) {
+  const out = {};
+  for (const r of list) (out[keyFn(r)] = out[keyFn(r)] ?? []).push(r);
+  return out;
+}
+
+function sorted(groups, scoreFn) {
+  return Object.entries(groups).sort((a, b) => scoreFn(b[1]) - scoreFn(a[1]));
 }
 
 function band(Box, Text, columns) {
@@ -242,10 +463,27 @@ function band(Box, Text, columns) {
     const pctUsed = Math.round(l.percentUsed);
     const left = resetIn(l.resetsAt);
     meter.push({ text: name + " " + pctUsed + "%" + (left ? " (" + left + ")" : ""), color: pctUsed >= 80 ? "red" : pctUsed >= 50 ? "yellow" : undefined, dim: pctUsed < 50 });
+    const projected = l.kind === "five_hour" ? projection(l) : null;
+    if (projected !== null) meter.push({ text: "→ 予測 " + projected + "%", color: "red" });
   }
-  meter.push({ text: "圧縮 " + compactions().length, dim: true });
+  const last = [...rows].reverse().find((r) => r.t === "step" && !r.agentId);
+  if (last) meter.push({ text: "前回 " + (ago(last.at) || "今"), dim: true });
+  meter.push({ text: "圧縮 " + rows.filter((r) => r.t === "compact" && !r.agentId).length, dim: true });
 
   return Box({ flexDirection: "column", paddingX: 1, children: [line(Text, head, columns), line(Text, meter, columns)] });
+}
+
+// 5h 枠をこのままの速さで使うと、リセット時に何 % になるか。100% に届くときだけ返す。
+// 最初の観測から10分たつまでは、速さが当てにならないので出さない
+function projection(l) {
+  const first = pace[l.resetsAt];
+  const reset = Date.parse(l.resetsAt);
+  const now = Date.now();
+  if (!first || !(reset > now) || now - first.at < 600_000) return null;
+  const rate = (l.percentUsed - first.pct) / (now - first.at);
+  if (!(rate > 0)) return null;
+  const projected = Math.round(l.percentUsed + rate * (reset - now));
+  return projected >= 100 ? projected : null;
 }
 
 // 幅に入らなければ後ろから落とす
@@ -262,60 +500,32 @@ function line(Text, segments, columns) {
   return Text({ children });
 }
 
-function summary() {
-  const steps = rows.filter((r) => r.t === "step");
-  const spawns = rows.filter((r) => r.t === "spawn");
-  const typeOf = {};
-  for (const s of spawns) if (s.agentId) typeOf[s.agentId] = s.type;
-
-  const sum = (list) => list.reduce((a, r) => ({
-    in: a.in + r.in, out: a.out + r.out, cacheRead: a.cacheRead + r.cacheRead, cacheWrite: a.cacheWrite + r.cacheWrite,
-  }), { in: 0, out: 0, cacheRead: 0, cacheWrite: 0 });
-  const fmt = (t) => "in " + short(t.in) + " / out " + short(t.out) + " / cache read " + short(t.cacheRead) + " / cache write " + short(t.cacheWrite);
-
-  const lines = [];
-  const comp = compactions();
-  lines.push("圧縮: " + comp.length + " 回" + (comp.length ? "（直前の context: " + comp.map((c) => short(c.tokens ?? 0) + " " + c.trigger).join(", ") + "）" : ""));
-  lines.push("閾値: " + (info.threshold ? short(info.threshold) + "（" + info.source + "）" : "取得できず"));
-  lines.push("メインループ: " + steps.filter((r) => !r.agentId).length + " リクエスト, " + fmt(sum(steps.filter((r) => !r.agentId))));
-
-  const byType = {};
-  for (const r of steps.filter((r) => r.agentId)) {
-    const type = typeOf[r.agentId] ?? "(不明)";
-    (byType[type] = byType[type] ?? []).push(r);
-  }
-  const counts = {};
-  for (const s of spawns) counts[s.type] = (counts[s.type] ?? 0) + 1;
-  const types = Object.keys({ ...byType, ...counts });
-  if (types.length) {
-    lines.push("サブエージェント:");
-    for (const type of types) {
-      lines.push("  " + type + ": 起動 " + (counts[type] ?? 0) + " 回, " + fmt(sum(byType[type] ?? [])));
-    }
-  }
-
-  const adv = (list) => list.reduce((a, r) => a + (r.advisor ?? 0), 0);
-  lines.push("advisor: メイン " + adv(steps.filter((r) => !r.agentId)) + " 回 / サブエージェント " + adv(steps.filter((r) => r.agentId)) + " 回");
-
-  const rl = rows.filter((r) => r.t === "ratelimit");
-  if (rl.length) lines.push("利用枠の線越え: " + rl.map((r) => r.kind + " " + r.line + "%").join(", "));
-  if (capped) lines.push("記録は " + MAX_ROWS + " 行で打ち切り済み");
-  lines.push("記録: " + (file ?? "(未設定)"));
-  return lines.join("\n");
-}
-
 // statusline.sh と同じ色
 const EFFORT_COLOR = { low: "green", medium: "yellow", high: "cyan", xhigh: "magenta", max: "red" };
 
 // リセットまでの残り時間（statusline.sh と同じ書式: 3d17h / 4h25m / 12m）
 function resetIn(iso) {
   if (!iso) return "";
-  const sec = Math.floor((Date.parse(iso) - Date.now()) / 1000);
-  if (!(sec > 0)) return "";
+  return span(Math.floor((Date.parse(iso) - Date.now()) / 1000));
+}
+
+// 経過時間（同じ書式。1分未満は空）
+function ago(at) {
+  return span(Math.floor((Date.now() - at) / 1000));
+}
+
+function span(sec) {
+  if (!(sec >= 60)) return "";
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
   if (d > 0) return d + "d" + h + "h";
   if (h > 0) return h + "h" + m + "m";
   return m + "m";
+}
+
+function duration(ms) {
+  if (ms < 1000) return ms + "ms";
+  if (ms < 60_000) return (ms / 1000).toFixed(1) + "s";
+  return span(Math.floor(ms / 1000));
 }
 
 function short(n) {
