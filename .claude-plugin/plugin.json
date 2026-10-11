@@ -1,0 +1,6 @@
+{
+  "name": "session-meter",
+  "version": "0.1.0",
+  "description": "圧縮・リクエストごとの cache・サブエージェントの起動・advisor の経路・利用枠をセッションごとの JSONL に記録し、プロンプトの上に context（autocompact の閾値比）と利用枠を出す。",
+  "author": { "name": "s0ar" }
+}
