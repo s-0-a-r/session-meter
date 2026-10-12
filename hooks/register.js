@@ -12,16 +12,24 @@
 // /metrics 7d         直近7日の全セッションの集計
 // /metrics prune 30d  更新から30日を過ぎた記録ファイルを消す（手で呼んだときだけ）
 
-const MAX_ROWS = 20000;
-const FILE_NAME = /^[0-9a-f-]{36}\.jsonl$/;
+// fs.read と fs.write は 4 MiB を超えると失敗するので、余裕を見て 3 MiB で記録を打ち切る
+const MAX_BYTES = 3 * 1024 * 1024;
+// <session-id>.jsonl と、読み込めなかったときの退避先 <session-id>.<時刻>.jsonl
+const FILE_NAME = /^[0-9a-f-]{36}(\.\d+)?\.jsonl$/;
 const DAY = 86_400_000;
 
 let rows = [];
 let file = null;
 let dir = null;
 let sessionId = null;
-let dirty = false;
+// 書き出す内容の大きさ（バイト）。push のたびに足す
+let bytes = 0;
+// push のたびに増やす。書き出しの間に増えた行を取りこぼさないため
+let seq = 0;
+let flushedSeq = 0;
 let capped = false;
+// 「前回 Nm」を描き直すタイマーを動かしたか。/clear では module が続くので二重に動かさない
+let ticking = false;
 
 // 帯に出す値
 let info = { model: "", repoName: "", branch: "", effort: null, threshold: null, source: null };
@@ -125,7 +133,7 @@ export function register(on) {
 
   on("turn.complete", async ($, e, next) => {
     const r = await next(e);
-    // サブエージェントだけが動いている間も書き出す（dirty でなければ何もしない）
+    // サブエージェントだけが動いている間も書き出す（新しい行がなければ何もしない）
     await flush($);
     return r;
   }).catch(fail);
@@ -133,12 +141,22 @@ export function register(on) {
   on("session.end", async ($, e, next) => {
     const start = rows.find((r) => r.t === "start");
     push({ t: "end", reason: e.reason, durationMs: start ? Date.now() - start.at : undefined });
-    await flush($);
+    try {
+      await flush($);
+    } catch (err) {
+      noteFailure($, "書き出し", err);
+    }
     const r = await next(e);
     // /clear と resume ではプロセスが別の session id で続き、session.start は来ない。
-    // ここで記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる
-    if (e.reason === "clear" || e.reason === "resume") {
-      await setup($);
+    // ここで記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる。
+    // session.end は core を含めて 1.5 秒しかないので、git などは呼ばず前の値を使う
+    if ((e.reason === "clear" || e.reason === "resume") && dir) {
+      const id = await $.session.id();
+      if (id !== sessionId) {
+        await openFile($, id);
+        markStart();
+        await flushSafely($);
+      }
     }
     return r;
   }).catch(fail);
@@ -173,6 +191,11 @@ function fail($, e, next) {
   return undefined;
 }
 
+// 記録の途中で失敗したことを残す
+function noteFailure($, where, err) {
+  $.ui.log("session-meter: " + where + " に失敗: " + (err?.message ?? String(err)));
+}
+
 // turn.step 用。generator でなければならないので、下の結果をそのまま流す
 async function* failStream($, e, next) {
   $.ui.log("session-meter: turn.step " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
@@ -180,32 +203,16 @@ async function* failStream($, e, next) {
 }
 
 async function setup($) {
-  sessionId = await $.session.id();
   const home = await $.env.get("HOME");
-  dir = home + "/.claude/mod-metrics";
-  file = dir + "/" + sessionId + ".jsonl";
-
-  rows = [];
-  crossed = {};
-  capped = false;
-  lastMainAt = null;
-  compactCount = 0;
-  let restoredEffort;
-  if (await $.fs.exists(file)) {
-    for (const row of parseRows(await $.fs.read(file))) {
-      rows.push(row);
-      if (row.t === "ratelimit") {
-        const key = row.kind + "@" + (row.resetsAt ?? "");
-        crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
-      }
-      if (row.t === "capped") capped = true;
-      if (row.t === "step" && !row.agentId) {
-        lastMainAt = row.at;
-        if (row.effort !== undefined) restoredEffort = row.effort;
-      }
-      if (row.t === "compact" && !row.agentId) compactCount++;
-    }
+  if (!home) {
+    // 相対パス（undefined/.claude/...）に書かないよう、記録先が決まらなければ何もしない
+    file = null;
+    dir = null;
+    noteFailure($, "準備", "HOME が取れないので記録しません");
+    return;
   }
+  dir = home + "/.claude/mod-metrics";
+  const restoredEffort = await openFile($, await $.session.id());
 
   try {
     await $.command.register({ name: "metrics", description: "計測の集計（引数なし: このセッション、7d: 直近7日、prune 30d: 古い記録を消す）" });
@@ -213,45 +220,106 @@ async function setup($) {
     // 読み込み直しで登録済みのときもここに来る
   }
 
-  const usage = await $.session.usage({ breakdown: "summary" });
-  info.threshold = usage.context?.breakdown?.autoCompactThreshold ?? null;
-  info.source = usage.context?.breakdown?.autocompactSource ?? null;
-  ctx = { tokens: usage.context?.tokens ?? 0, window: usage.context?.window ?? 0 };
-  limits = usage.rateLimits ?? [];
-
-  info.model = await $.session.model();
+  // ここから先は帯と start 行に出す値。1つ取れなくても、ほかは進める
+  try {
+    const usage = await $.session.usage({ breakdown: "summary" });
+    info.threshold = usage.context?.breakdown?.autoCompactThreshold ?? null;
+    info.source = usage.context?.breakdown?.autocompactSource ?? null;
+    ctx = { tokens: usage.context?.tokens ?? 0, window: usage.context?.window ?? 0 };
+    limits = usage.rateLimits ?? [];
+  } catch (err) {
+    noteFailure($, "使用量の取得", err);
+  }
+  try {
+    info.model = await $.session.model();
+  } catch (err) {
+    noteFailure($, "モデル名の取得", err);
+  }
   // effort はセッション単位で読む API がないので、最初の応答までは settings の値を出す。
   // 応答が来たら turn.step の e.effort（/effort での変更も反映される）で上書きする
   if (restoredEffort !== undefined) {
     info.effort = restoredEffort;
   } else {
-    const settings = await $.settings.read();
-    info.effort = settings.modelSettings?.[info.model]?.effortLevel ?? settings.effortLevel ?? null;
+    try {
+      const settings = await $.settings.read();
+      info.effort = settings.modelSettings?.[info.model]?.effortLevel ?? settings.effortLevel ?? null;
+    } catch (err) {
+      noteFailure($, "settings の読み込み", err);
+    }
   }
-  const repo = await $.session.repo();
-  info.repoName = repo ? repo.root.split("/").pop() : "";
+  try {
+    const repo = await $.session.repo();
+    info.repoName = repo ? repo.root.split("/").pop() : "";
+  } catch (err) {
+    noteFailure($, "リポジトリの取得", err);
+  }
   info.branch = "";
   try {
     const r = await $.process.run(["git", "branch", "--show-current"], { timeoutMs: 3000 });
     if (r.exitCode === 0) info.branch = r.stdout.trim();
   } catch {
-    // git がない、リポジトリ外など
+    // git がない、リポジトリ外など。失敗ではない
   }
 
-  // 読み込み直しでは start を重ねず、reload の行だけ残す
+  markStart();
+  // 最初の応答より前に読み込み直されても start 行が残るよう、ここで書き出す
+  await flushSafely($);
+
+  // 「前回 Nm」を進めるため、1分ごとに描き直す。読み込み直すと古いタイマーは host が取り消す
+  if (!ticking) {
+    ticking = true;
+    $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
+  }
+
+  $.ui.invalidate("ui.render");
+}
+
+// 記録先を id のファイルにし、あれば行を読み戻す。最後のメインの応答の effort を返す。
+// 読めなかったときは元のファイルを上書きしないよう、別名のファイルに書く
+async function openFile($, id) {
+  sessionId = id;
+  file = dir + "/" + id + ".jsonl";
+  rows = [];
+  bytes = 0;
+  seq = 0;
+  flushedSeq = 0;
+  crossed = {};
+  capped = false;
+  lastMainAt = null;
+  compactCount = 0;
+  let text = null;
+  try {
+    if (await $.fs.exists(file)) text = await $.fs.read(file);
+  } catch (err) {
+    file = dir + "/" + id + "." + Date.now() + ".jsonl";
+    noteFailure($, "記録の読み込み", err);
+    return undefined;
+  }
+  let effort;
+  for (const row of parseRows(text ?? "")) {
+    rows.push(row);
+    bytes += rowBytes(row);
+    if (row.t === "ratelimit") {
+      const key = row.kind + "@" + (row.resetsAt ?? "");
+      crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
+    }
+    if (row.t === "capped") capped = true;
+    if (row.t === "step" && !row.agentId && !row.aborted) {
+      lastMainAt = row.at;
+      if (row.effort !== undefined) effort = row.effort;
+    }
+    if (row.t === "compact" && !row.agentId) compactCount++;
+  }
+  return effort;
+}
+
+// 読み込み直しでは start を重ねず、reload の行だけ残す
+function markStart() {
   if (rows.some((r) => r.t === "start")) {
     push({ t: "reload" });
   } else {
     push({ t: "start", model: info.model, repo: info.repoName, threshold: info.threshold, source: info.source });
   }
-
-  // 最初の応答より前に読み込み直されても start 行が残るよう、ここで書き出す
-  await flush($);
-
-  // 「前回 Nm」を進めるため、1分ごとに描き直す。読み込み直すと古いタイマーは host が取り消す
-  $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
-
-  $.ui.invalidate("ui.render");
 }
 
 function recordStep($, e, r) {
@@ -281,20 +349,45 @@ function recordStep($, e, r) {
 
 function push(row) {
   if (capped) return;
-  if (rows.length >= MAX_ROWS) {
-    rows.push({ t: "capped", at: Date.now(), max: MAX_ROWS });
+  const full = { at: Date.now(), ...row };
+  const size = rowBytes(full);
+  if (bytes + size > MAX_BYTES) {
+    const mark = { t: "capped", at: Date.now(), maxBytes: MAX_BYTES };
+    rows.push(mark);
+    bytes += rowBytes(mark);
     capped = true;
-    dirty = true;
-    return;
+  } else {
+    rows.push(full);
+    bytes += size;
   }
-  rows.push({ at: Date.now(), ...row });
-  dirty = true;
+  seq++;
 }
 
+// 書けたときだけ「書き出し済み」にする。失敗したら次の書き出しで同じ行をもう一度書く
 async function flush($) {
-  if (!file || !dirty) return;
-  dirty = false;
+  if (!file || seq === flushedSeq) return;
+  const upTo = seq;
   await $.fs.write(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  flushedSeq = upTo;
+}
+
+async function flushSafely($) {
+  try {
+    await flush($);
+  } catch (err) {
+    noteFailure($, "書き出し", err);
+  }
+}
+
+// JSON にしたときの UTF-8 のバイト数（改行を含む）
+function rowBytes(row) {
+  const json = JSON.stringify(row);
+  let n = 1;
+  for (let i = 0; i < json.length; i++) {
+    const c = json.charCodeAt(i);
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : c >= 0xd800 && c < 0xdc00 ? (i++, 4) : 3;
+  }
+  return n;
 }
 
 function parseRows(text) {
@@ -304,7 +397,8 @@ function parseRows(text) {
     try {
       out.push(JSON.parse(line));
     } catch {
-      // 壊れた行は読み飛ばす
+      // 壊れた行も捨てずに残す。ファイル全体を書き直すときに消えないように
+      out.push({ t: "broken", raw: line });
     }
   }
   return out;
@@ -336,7 +430,7 @@ async function period($, days) {
     }
   };
   for (const f of await metricFiles($)) {
-    const sid = f.name.replace(/\.jsonl$/, "");
+    const sid = f.name.slice(0, 36);
     // いまのセッションは、まだ書き出していない行があるのでメモリから取る
     if (sid === sessionId) continue;
     if (f.mtimeMs < since) continue;
@@ -351,7 +445,8 @@ async function prune($, arg) {
   const days = parseDays(arg);
   if (!days) return USAGE;
   const before = Date.now() - days * DAY;
-  const old = (await metricFiles($)).filter((f) => f.mtimeMs < before && f.name !== sessionId + ".jsonl");
+  // いまのセッションのファイル（退避先を含む）は消さない
+  const old = (await metricFiles($)).filter((f) => f.mtimeMs < before && f.name.slice(0, 36) !== sessionId);
   if (!old.length) return days + " 日より前の記録ファイルはありません";
   const r = await $.process.run(["rm", "--", ...old.map((f) => dir + "/" + f.name)], { timeoutMs: 10000 });
   if (r.exitCode !== 0) return "削除に失敗しました: " + r.stderr.trim();
@@ -363,7 +458,7 @@ function summary() {
   const all = rows.map((r) => ({ ...r, sid: sessionId }));
   const lines = [report(all, { rateLimits: true })];
   lines.push("閾値: " + (info.threshold ? short(info.threshold) + "（" + info.source + "）" : "取得できず"));
-  if (capped) lines.push("記録は " + MAX_ROWS + " 行で打ち切り済み");
+  if (capped) lines.push("記録は " + short(MAX_BYTES) + "B で打ち切り済み");
   lines.push("記録: " + (file ?? "(未設定)"));
   return lines.join("\n");
 }

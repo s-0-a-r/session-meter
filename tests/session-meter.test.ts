@@ -7,21 +7,28 @@ const OTHER = '00000000-0000-0000-0000-000000000002'
 const DAY = 86_400_000
 
 type Files = Record<string, { text: string; mtimeMs?: number }>
+// 失敗させたい API。writeFailures は先頭から何回失敗させるか
+type Faults = { read?: boolean; writeFailures?: number; usage?: boolean; noHome?: boolean }
 
 // session.start が呼ぶ API をまとめて差し替える。files は仮のファイルシステム（パス → 中身）
-function stubSession(on: any, files: Files = {}) {
+function stubSession(on: any, files: Files = {}, faults: Faults = {}) {
   const written: string[] = []
   const runs: string[][] = []
-  mock.env(on, { HOME: '/home/test' })
+  mock.env(on, faults.noHome ? {} : { HOME: '/home/test' })
   const clock = mock.clock(on, { now: 1_000_000 })
   on('session.start', () => ({ cwd: '/work' }))
   const id = { value: SID }
   on('session.id', () => ({ value: id.value }))
   on('session.model', () => ({ value: 'claude-test' }))
   on('session.repo', () => ({ value: { root: '/work/repo', remote: null, internal: false } }))
-  on('session.usage', () => ({
+  const calls = { usage: 0, git: 0, invalidate: 0, logs: [] as string[] }
+  on('session.usage', () => {
+    calls.usage++
+    if (faults.usage) throw new Error('usage unavailable')
+    return {
     value: { startedAt: 0, context: { tokens: 1000, window: 1000000, breakdown: { autoCompactThreshold: 320000, autocompactSource: 'env' } }, rateLimits: [] },
-  }))
+    }
+  })
   const counts = { settingsRead: 0 }
   on('settings.read', () => {
     counts.settingsRead++
@@ -29,27 +36,42 @@ function stubSession(on: any, files: Files = {}) {
   })
   on('process.run', ($: any, e: any) => {
     runs.push(e.argv ?? e.command ?? e)
+    if ((e.argv ?? [])[0] === 'git') calls.git++
     return { value: { exitCode: 0, stdout: 'main\n', stderr: '' } }
   })
   on('fs.exists', ($: any, e: any) => ({ value: e.path === DIR ? Object.keys(files).length > 0 : e.path in files }))
-  on('fs.read', ($: any, e: any) => ({ value: files[e.path]?.text ?? '' }))
+  on('fs.read', ($: any, e: any) => {
+    if (faults.read) throw new Error('EACCES: permission denied')
+    return { value: files[e.path]?.text ?? '' }
+  })
   on('fs.list', ($: any, e: any) => ({
     value: Object.entries(files)
       .filter(([p]) => p.startsWith(e.path + '/'))
       .map(([p, f]) => ({ name: p.slice(e.path.length + 1), kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs ?? Date.now(), isLink: false })),
   }))
   const writes: { path: string; text: string }[] = []
+  let writeFailures = faults.writeFailures ?? 0
   on('fs.write', ($: any, e: any) => {
+    if (writeFailures > 0) {
+      writeFailures--
+      throw new Error('ENOSPC: no space left on device')
+    }
     written.push(e.text)
     writes.push({ path: e.path, text: e.text })
     return { value: undefined }
   })
   on('command.register', () => ({ value: undefined }))
-  on('ui.log', () => ({ value: undefined }))
-  on('ui.invalidate', () => ({ value: undefined }))
+  on('ui.log', ($: any, e: any) => {
+    calls.logs.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.invalidate', () => {
+    calls.invalidate++
+    return { value: undefined }
+  })
   on('turn.complete', () => ({ text: '' }))
   on('session.end', ($: any, e: any) => ({ sessionId: e.sessionId }))
-  return { written, writes, runs, clock, id, counts }
+  return { written, writes, runs, clock, id, counts, calls }
 }
 
 function lastRows(written: string[]) {
@@ -287,4 +309,87 @@ test('/metrics 7d は、期間より前に起動したセッションのリポ�
   expect(text).toContain('old-repo: 1 リクエスト')
   expect(text).toContain('Plan [test]')
   expect(text).not.toContain('(不明)')
+})
+
+test('記録ファイルが読めないと、元のファイルには書かず別名のファイルに書く', async ($, on) => {
+  const { writes, calls } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }]) } }, { read: true })
+  await start($)
+  expect(writes.some((w) => w.path === DIR + '/' + SID + '.jsonl')).toBe(false)
+  expect(writes.at(-1)!.path).toMatch(new RegExp('^' + DIR + '/' + SID + '\\.\\d+\\.jsonl$'))
+  expect(calls.logs.some((l) => l.includes('記録の読み込み'))).toBe(true)
+})
+
+test('壊れた行は、書き直したあとも残る', async ($, on) => {
+  const { written } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: '{"at":1,"t":"start"}\n{not json\n' } })
+  await start($)
+  expect(lastRows(written).find((r) => r.t === 'broken')).toMatchObject({ raw: '{not json' })
+})
+
+test('書き出しに失敗しても、次の書き出しで同じ行を書く', async ($, on) => {
+  const { written } = stubSession(on, {}, { writeFailures: 1 })
+  stubStep(on)
+  await start($)
+  expect(written.length).toBe(0)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  expect(lastRows(written).map((r) => r.t)).toEqual(['start'])
+})
+
+test('3 MiB を超える前に記録を打ち切り、capped の行を1つだけ書く', async ($, on) => {
+  const { written } = stubSession(on)
+  on('tool.call', () => ({ ref: 1, result: {}, text: '' }))
+  await start($)
+  const big = 'x'.repeat(200_000)
+  for (let i = 0; i < 20; i++) await $.tool.call({ tool: 'mcp__' + big + i } as any)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  const rows = lastRows(written)
+  expect(rows.filter((r) => r.t === 'capped').length).toBe(1)
+  expect(written.at(-1)!.length).toBeLessThan(3 * 1024 * 1024)
+})
+
+test('/clear では git も usage も呼ばずに新しいファイルへ切り替える', async ($, on) => {
+  const { writes, id, calls } = stubSession(on, {}, {})
+  await start($)
+  const before = { usage: calls.usage, git: calls.git }
+  id.value = OTHER
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  expect(calls.usage).toBe(before.usage)
+  expect(calls.git).toBe(before.git)
+  expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
+})
+
+test('/clear の前の書き出しが失敗しても、新しいファイルに切り替える', async ($, on) => {
+  const { writes, id } = stubSession(on, {}, { writeFailures: 2 })
+  await start($)
+  id.value = OTHER
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
+})
+
+test('使用量が取れなくても、start 行を書き、帯のモデル名は入る', async ($, on) => {
+  const { written } = stubSession(on, {}, { usage: true })
+  await start($)
+  expect(lastRows(written)[0]).toMatchObject({ t: 'start', model: 'claude-test', repo: 'repo' })
+})
+
+test('HOME が無いときは何も書かない', async ($, on) => {
+  const { writes, calls } = stubSession(on, {}, { noHome: true })
+  stubStep(on)
+  await start($)
+  await step($)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  expect(writes.length).toBe(0)
+  expect(calls.logs.some((l) => l.includes('HOME'))).toBe(true)
+})
+
+test('/clear を2回しても、描き直しのタイマーは1つ', async ($, on) => {
+  const { id, clock, calls } = stubSession(on)
+  await start($)
+  id.value = OTHER
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = '00000000-0000-0000-0000-000000000003'
+  await $.session.end({ reason: 'clear', sessionId: OTHER, resume: OTHER })
+  await clock.settle()
+  const before = calls.invalidate
+  await clock.advance(60_000)
+  expect(calls.invalidate - before).toBe(1)
 })
