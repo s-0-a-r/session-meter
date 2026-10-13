@@ -437,3 +437,23 @@ test('/metrics の処理が失敗しても、理由を答える', async ($, on) 
   await start($)
   expect(await metrics($, '7d')).toContain('/metrics に失敗しました: ')
 })
+
+test('中断した応答はリクエスト数とトークンに入れず、中断の回数として出す', async ($, on) => {
+  stubSession(on)
+  let n = 0
+  on('turn.step', async function* ($: any, e: any) {
+    yield { kind: 'text', index: 0, text: 'ok' }
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: n++ === 0 ? USAGE : null, serverToolUses: [] }
+  })
+  await start($)
+  await step($)
+  await step($)
+  const text = await metrics($)
+  expect(text).toContain('メインループ: 1 リクエスト（ほかに中断 1 回）, in 10 /')
+})
+
+test('圧縮前のトークン数が取れなかったときは ? と出す', async ($, on) => {
+  stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }, { at: 2, t: 'compact', trigger: 'manual', tokens: null, after: 18000 }]) } })
+  await start($)
+  expect(await metrics($)).toContain('?→18k manual')
+})

@@ -334,7 +334,7 @@ async function openFile($, id) {
       crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
     }
     if (row.t === "capped") capped = true;
-    if (row.t === "step" && !row.agentId && !row.aborted) {
+    if (row.t === "step" && !row.agentId) {
       lastMainAt = row.at;
       if (row.effort !== undefined) effort = row.effort;
     }
@@ -356,7 +356,10 @@ function recordStep($, e, r) {
   try {
     const u = r?.usage;
     const advisor = (r?.serverToolUses ?? []).filter((s) => s.name === "advisor").length;
-    push({
+    if (!u) {
+      // 中断した応答は usage が無い。0 トークンのリクエストとして数えないよう印を付ける
+      push({ t: "step", agentId: e.agentId, model: e.model, effort: e.effort, aborted: true, advisor: advisor || undefined });
+    } else push({
       t: "step",
       agentId: e.agentId,
       model: u?.model ?? e.model,
@@ -506,7 +509,9 @@ function summary() {
 
 // 行の配列（sid 付き）から集計を作る。このセッション用と期間集計で共通
 function report(list, opts = {}) {
-  const steps = list.filter((r) => r.t === "step");
+  // 中断した応答はトークンが無いので、リクエスト数と合計から外して別に数える
+  const steps = list.filter((r) => r.t === "step" && !r.aborted);
+  const aborted = list.filter((r) => r.t === "step" && r.aborted);
   const spawns = list.filter((r) => r.t === "spawn");
   const spawnOf = { ...opts.spawnOf };
   for (const s of spawns) if (s.agentId) spawnOf[s.agentId] = s;
@@ -517,12 +522,14 @@ function report(list, opts = {}) {
   const auto = comp.filter((c) => c.trigger === "auto").length;
   lines.push("圧縮: " + comp.length + " 回" + (comp.length ? "（auto " + auto + " / manual " + (comp.length - auto) + "）" : ""));
   if (comp.length && !opts.byRepo) {
-    lines.push("  " + comp.map((c) => short(c.tokens ?? 0) + (c.after != null ? "→" + short(c.after) : "") + " " + c.trigger).join(", "));
+    // 取れなかった値は 0 ではなく ? と出す
+    lines.push("  " + comp.map((c) => (c.tokens != null ? short(c.tokens) : "?") + (c.after != null ? "→" + short(c.after) : "") + " " + c.trigger).join(", "));
   }
 
   const rebuilt = rebuilds(list);
   const main = steps.filter(isMain);
-  lines.push("メインループ: " + main.length + " リクエスト, " + fmt(sum(main)) + ", " + cacheText(main, rebuilt));
+  const abortedMain = aborted.filter(isMain).length;
+  lines.push("メインループ: " + main.length + " リクエスト" + (abortedMain ? "（ほかに中断 " + abortedMain + " 回）" : "") + ", " + fmt(sum(main)) + ", " + cacheText(main, rebuilt));
 
   if (opts.byRepo) {
     const repoOf = { ...opts.repoOf };
@@ -585,7 +592,7 @@ function rebuilds(list) {
       seen.delete(loop);
       continue;
     }
-    if (r.t !== "step") continue;
+    if (r.t !== "step" || r.aborted) continue;
     if (seen.has(loop) && r.cacheWrite > r.cacheRead) out.add(r);
     seen.add(loop);
   }
