@@ -167,9 +167,16 @@ export function register(on) {
     // 記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる。
     // session.end の時点では $.session.id() がまだ古い id を返すことがある（実機で確認）
     // ので、印だけ付けて次の hook の最初に切り替える
-    if ((e.reason === "clear" || e.reason === "resume") && dir) {
-      switchPending = true;
-      await follow($);
+    if (e.reason === "clear" || e.reason === "resume") {
+      // 前のセッションの値を出し続けないよう、次の計測が来るまで ctx は不明にする
+      ctx = { tokens: null, window: ctx.window };
+      lastMainAt = null;
+      compactCount = 0;
+      $.ui.invalidate("ui.render");
+      if (dir) {
+        switchPending = true;
+        await follow($);
+      }
     }
     return r;
   }).catch(fail);
@@ -193,11 +200,10 @@ export function register(on) {
   });
 
   on("ui.render", { component: "AbovePrompt" }, ($, e, next) => {
-    if (e.props?.hasSurvey || !info.model) {
-      return next(e);
-    }
+    const lines = e.props?.hasSurvey ? [] : bandLines();
+    if (!lines.length) return next(e);
     const { Box, Text } = $.ui.resolve(e);
-    return band(Box, Text, e.props?.bodyColumns ?? 80);
+    return band(Box, Text, lines, e.props?.bodyColumns ?? 80);
   }).catch(failRender);
 }
 
@@ -680,17 +686,31 @@ function sorted(groups, scoreFn) {
   return Object.entries(groups).sort((a, b) => scoreFn(b[1]) - scoreFn(a[1]));
 }
 
-function band(Box, Text, columns) {
+function band(Box, Text, lines, columns) {
+  return Box({ flexDirection: "column", paddingX: 1, children: lines.map((segments) => line(Text, segments, columns)) });
+}
+
+// 帯の行（区切りごとの { text, color, bold, dim } の並び）。出すものが無ければ空。
+// モデル名が取れなくても、記録の失敗があれば2行目だけ出す（失敗に気づけるように）
+function bandLines() {
+  if (!info.model && !health.failures && !capped) return [];
   const den = info.threshold ?? ctx.window;
-  const pct = den ? Math.round((ctx.tokens / den) * 100) : 0;
+  const known = ctx.tokens !== null;
+  const pct = den && known ? Math.round((ctx.tokens / den) * 100) : 0;
   const ctxColor = pct >= 90 ? "red" : pct >= 70 ? "yellow" : "green";
 
-  const head = [{ text: info.model.replace(/^claude-/, ""), bold: true }];
-  if (info.effort !== null) head.push({ text: String(info.effort), color: EFFORT_COLOR[info.effort] });
-  if (info.repoName) head.push({ text: info.repoName + (info.branch ? "@" + info.branch : "") });
+  const lines = [];
+  if (info.model) {
+    const head = [{ text: info.model.replace(/^claude-/, ""), bold: true }];
+    if (info.effort !== null) head.push({ text: String(info.effort), color: EFFORT_COLOR[info.effort] });
+    if (info.repoName) head.push({ text: info.repoName + (info.branch ? "@" + info.branch : "") });
+    lines.push(head);
+  }
 
   const meter = [];
-  if (den) meter.push({ text: "ctx " + short(ctx.tokens) + "/" + short(den) + " (" + pct + "%)", color: ctxColor });
+  if (den) {
+    meter.push(known ? { text: "ctx " + short(ctx.tokens) + "/" + short(den) + " (" + pct + "%)", color: ctxColor } : { text: "ctx ?/" + short(den), dim: true });
+  }
   // 幅が狭くても落ちないよう、ctx の次に置く
   if (health.failures || capped) meter.push({ text: "⚠ 記録", color: "yellow" });
   for (const l of limits) {
@@ -702,8 +722,8 @@ function band(Box, Text, columns) {
   }
   if (lastMainAt) meter.push({ text: "前回 " + (ago(lastMainAt) || "今"), dim: true });
   meter.push({ text: "圧縮 " + compactCount, dim: true });
-
-  return Box({ flexDirection: "column", paddingX: 1, children: [line(Text, head, columns), line(Text, meter, columns)] });
+  lines.push(meter);
+  return lines;
 }
 
 // 5h 枠をこのままの速さで使うと、リセット時に何 % になるか。100% に届くときだけ返す。

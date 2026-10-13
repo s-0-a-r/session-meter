@@ -533,3 +533,35 @@ test('null や数値の行があっても読み込みを止めず、壊れた行
   expect(rows.filter((r) => r.t === 'broken').map((r) => r.raw)).toEqual(['null', '42'])
   expect(rows.some((r) => r.t === 'step')).toBe(true)
 })
+
+// 帯を端末に描かせて、出ている文字を返す
+async function bandText($: any) {
+  const ui = await $.ui.mount({ plugin: 'session-meter', surface: 'terminal', component: 'AbovePrompt', props: { bodyColumns: 200 } as any })
+  const found = await ui.findAll({ type: 'Text' })
+  return found.map((f: any) => f.text).join(' ')
+}
+
+test('帯: 通常はモデル名と ctx を出す', async ($, on) => {
+  stubSession(on)
+  await start($)
+  const text = await bandText($)
+  expect(text).toContain('test')
+  expect(text).toMatch(/ctx \d/)
+})
+
+test('帯: モデル名が取れなくても、記録の失敗があれば ⚠ 記録 を出す', async ($, on) => {
+  stubSession(on, {}, { noHome: true })
+  await start($)
+  expect(await bandText($)).toContain('⚠ 記録')
+})
+
+test('帯: /clear の直後は、次の計測まで ctx を ? と出す', async ($, on) => {
+  const { id } = stubSession(on)
+  on('session.measure', () => ({ changed: ['context'] }))
+  await start($)
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  expect(await bandText($)).toMatch(/ctx \?\//)
+  await $.session.measure({ context: { tokens: 1000, window: 1000000 }, rateLimits: [], changed: ['context'] } as any)
+  expect(await bandText($)).toMatch(/ctx 1/)
+})
