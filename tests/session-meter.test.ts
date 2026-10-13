@@ -240,6 +240,12 @@ test('最初の応答より前でも、起動した時点で start 行が書き�
   expect(lastRows(written).map((r) => r.t)).toEqual(['start'])
 })
 
+test('読み込み直しでは、最後のメインの応答の effort を引き継ぐ', async ($, on) => {
+  const { counts } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }, { at: 2, t: 'step', effort: 'max', in: 0, out: 0, cacheRead: 0, cacheWrite: 0 }]) } })
+  await start($)
+  expect(counts.settingsRead).toBe(0)
+})
+
 test('/clear のあとは、新しい session id のファイルに書く', async ($, on) => {
   const { writes, id } = stubSession(on)
   stubStep(on)
@@ -363,7 +369,7 @@ test('/clear の前の書き出しが失敗しても、新しいファイルに�
   expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
 })
 
-test('使用量が取れなくても、start 行にモデル名とリポジトリを書く', async ($, on) => {
+test('使用量が取れなくても、start 行を書き、帯のモデル名は入る', async ($, on) => {
   const { written } = stubSession(on, {}, { usage: true })
   await start($)
   expect(lastRows(written)[0]).toMatchObject({ t: 'start', model: 'claude-test', repo: 'repo' })
@@ -377,6 +383,19 @@ test('HOME が無いときは何も書かない', async ($, on) => {
   await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
   expect(writes.length).toBe(0)
   expect(calls.logs.some((l) => l.includes('HOME'))).toBe(true)
+})
+
+test('/clear を2回しても、描き直しのタイマーは1つ', async ($, on) => {
+  const { id, clock, calls } = stubSession(on)
+  await start($)
+  id.value = OTHER
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = '00000000-0000-0000-0000-000000000003'
+  await $.session.end({ reason: 'clear', sessionId: OTHER, resume: OTHER })
+  await clock.settle()
+  const before = calls.invalidate
+  await clock.advance(60_000)
+  expect(calls.invalidate - before).toBe(1)
 })
 
 test('書き出しに失敗すると /metrics に失敗の回数と未保存の行数が出る', async ($, on) => {

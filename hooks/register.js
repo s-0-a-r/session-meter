@@ -1,4 +1,4 @@
-// session-meter: セッションの計測を JSONL に残し、/metrics で集計する。
+// session-meter: セッションの計測を JSONL に残し、プロンプトの上に2行出す。
 //
 // どの hook も記録するだけで、Claude Code の判断や入力は変えない。失敗した
 // hook は .catch で「無かったもの」にし、本来の動作をそのまま進める。
@@ -6,7 +6,7 @@
 // 記録先は ~/.claude/mod-metrics/<session-id>.jsonl。行はメモリに溜め、
 // メインループの turn.complete と session.end でファイル全体を書き直す。
 // 保存するたびに module が読み込み直されるので、session.start でファイル
-// から行を読み戻す。
+// から行を読み戻す（圧縮の回数も行から数え直す）。
 //
 // /metrics            このセッションの集計
 // /metrics 7d         直近7日の全セッションの集計
@@ -28,20 +28,29 @@ let bytes = 0;
 let seq = 0;
 let flushedSeq = 0;
 let capped = false;
+// 「前回 Nm」を描き直すタイマーを動かしたか。/clear では module が続くので二重に動かさない
+let ticking = false;
 // /clear・resume のあと、新しい session id へ切り替えるのを待っているか
 let switchPending = false;
 // 進行中の切り替え。複数の hook が同時に follow を呼んでも1回だけ切り替える
 let following = null;
-// 記録の失敗。/metrics に出す。同じ内容のログは transcript に1回だけ出す
+// 記録の失敗。/metrics と帯に出す。同じ内容のログは transcript に1回だけ出す
 let health = { failures: 0, last: null };
 const logged = new Set();
 
-// start 行に書く値
-let info = { model: "", repoName: "", threshold: null, source: null };
+// 帯に出す値
+let info = { model: "", repoName: "", branch: "", effort: null, threshold: null, source: null };
+let ctx = { tokens: 0, window: 0 };
+let limits = [];
 // 利用枠ごとに、記録済みの一番高い 10 ポイント刻みの線
 let crossed = {};
 // 5h 枠のペース予測用。resetsAt ごとに、最初に見た時刻と使用率（メモリにだけ持つ）
 let pace = {};
+// 帯に出す予測（%）。100% に届かないときは null
+let projected = null;
+// 帯の描画のたびに全行を走査しないよう、最後のメインの応答時刻と圧縮回数を持つ
+let lastMainAt = null;
+let compactCount = 0;
 
 export function register(on) {
   on("session.start", async ($, e, next) => {
@@ -96,6 +105,11 @@ export function register(on) {
         // tokensBefore は core が記録しなかったときだけ無い。そのときはメインループに限り直前の計測で補う
         const tokens = r.tokensBefore ?? before?.context?.tokens ?? null;
         push({ t: "compact", trigger: e.trigger, agentId: e.agentId, tokens, after: r.tokensAfter, threshold: info.threshold });
+        if (!e.agentId) {
+          if (rows.at(-1)?.t === "compact") compactCount++;
+          if (r.tokensAfter != null) ctx.tokens = r.tokensAfter;
+        }
+        $.ui.invalidate("ui.render");
         // /compact はターンではなく turn.complete が来ないので、ここで書き出す
         await flush($);
       } catch (err) {
@@ -109,7 +123,10 @@ export function register(on) {
   on("session.measure", async ($, e, next) => {
     await follow($);
     const now = await $.clock.now();
-    for (const l of e.rateLimits ?? []) {
+    ctx = { tokens: e.context?.tokens ?? 0, window: e.context?.window ?? 0 };
+    limits = e.rateLimits ?? [];
+    projected = null;
+    for (const l of limits) {
       const key = l.kind + "@" + (l.resetsAt ?? "");
       const line = Math.floor(l.percentUsed / 10) * 10;
       if (line > 0 && line > (crossed[key] ?? 0)) {
@@ -118,13 +135,14 @@ export function register(on) {
       }
       if (l.kind === "five_hour" && l.resetsAt) {
         const first = pace[l.resetsAt] ?? (pace[l.resetsAt] = { at: now, pct: l.percentUsed, warned: false });
-        const projected = projection(first, l, now);
+        projected = projection(first, l, now);
         if (projected !== null && !first.warned) {
           first.warned = true;
           push({ t: "pace", kind: l.kind, percentUsed: l.percentUsed, projected, resetsAt: l.resetsAt });
         }
       }
     }
+    $.ui.invalidate("ui.render");
     return next(e);
   }).catch(fail);
 
@@ -174,6 +192,13 @@ export function register(on) {
     return { text: "/metrics に失敗しました: " + (next.error?.message ?? next.error?.kind ?? "原因不明") };
   });
 
+  on("ui.render", { component: "AbovePrompt" }, ($, e, next) => {
+    if (e.props?.hasSurvey || !info.model) {
+      return next(e);
+    }
+    const { Box, Text } = $.ui.resolve(e);
+    return band(Box, Text, e.props?.bodyColumns ?? 80);
+  }).catch(failRender);
 }
 
 const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（直近7日） / /metrics prune 30d（30日より前の記録ファイルを消す）";
@@ -183,6 +208,15 @@ const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（�
 function fail($, e, next) {
   if (next.error?.kind !== "re-entry") {
     noteFailure($, "hook " + next.event, (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
+  }
+  return undefined;
+}
+
+// 帯の描画用。描き直しを頼むとまた失敗して描画が回り続けるので、数えるだけにする
+function failRender($, e, next) {
+  if (next.error?.kind !== "re-entry") {
+    health.failures++;
+    health.last = "hook ui.render の失敗: " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? "");
   }
   return undefined;
 }
@@ -208,6 +242,7 @@ function noteFailure($, where, err) {
       logged.add(message);
       $.ui.log("session-meter: " + message);
     }
+    $.ui.invalidate("ui.render");
   } catch {
     // ログが出せなくても、数は /metrics に残る
   }
@@ -223,7 +258,7 @@ async function setup($) {
     return;
   }
   dir = home + "/.claude/mod-metrics";
-  await openFile($, await $.session.id());
+  const restoredEffort = await openFile($, await $.session.id());
 
   try {
     await $.command.register({ name: "metrics", description: "計測の集計（引数なし: このセッション、7d: 直近7日、prune 30d: 古い記録を消す）" });
@@ -231,11 +266,13 @@ async function setup($) {
     // 読み込み直しで登録済みのときもここに来る
   }
 
-  // ここから先は start 行に書く値。1つ取れなくても、ほかは進める
+  // ここから先は帯と start 行に出す値。1つ取れなくても、ほかは進める
   try {
     const usage = await $.session.usage({ breakdown: "summary" });
     info.threshold = usage.context?.breakdown?.autoCompactThreshold ?? null;
     info.source = usage.context?.breakdown?.autocompactSource ?? null;
+    ctx = { tokens: usage.context?.tokens ?? 0, window: usage.context?.window ?? 0 };
+    limits = usage.rateLimits ?? [];
   } catch (err) {
     noteFailure($, "使用量の取得", err);
   }
@@ -244,19 +281,46 @@ async function setup($) {
   } catch (err) {
     noteFailure($, "モデル名の取得", err);
   }
+  // effort はセッション単位で読む API がないので、最初の応答までは settings の値を出す。
+  // 応答が来たら turn.step の e.effort（/effort での変更も反映される）で上書きする
+  if (restoredEffort !== undefined) {
+    info.effort = restoredEffort;
+  } else {
+    try {
+      const settings = await $.settings.read();
+      info.effort = settings.modelSettings?.[info.model]?.effortLevel ?? settings.effortLevel ?? null;
+    } catch (err) {
+      noteFailure($, "settings の読み込み", err);
+    }
+  }
   try {
     const repo = await $.session.repo();
     info.repoName = repo ? repo.root.split("/").pop() : "";
   } catch (err) {
     noteFailure($, "リポジトリの取得", err);
   }
+  info.branch = "";
+  try {
+    const r = await $.process.run(["git", "branch", "--show-current"], { timeoutMs: 3000 });
+    if (r.exitCode === 0) info.branch = r.stdout.trim();
+  } catch {
+    // git がない、リポジトリ外など。失敗ではない
+  }
 
   markStart();
   // 最初の応答より前に読み込み直されても start 行が残るよう、ここで書き出す
   await flushSafely($);
+
+  // 「前回 Nm」を進めるため、1分ごとに描き直す。読み込み直すと古いタイマーは host が取り消す
+  if (!ticking) {
+    ticking = true;
+    $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
+  }
+
+  $.ui.invalidate("ui.render");
 }
 
-// 記録先を id のファイルにし、あれば行を読み戻す。
+// 記録先を id のファイルにし、あれば行を読み戻す。最後のメインの応答の effort を返す。
 // 読めなかったときは元のファイルを上書きしないよう、別名のファイルに書く
 // carry が true（/clear・resume の切り替え）のときは、失敗の数と利用枠の線越えを引き継ぐ。
 // 利用枠はセッションをまたいで続くので、越えた線を新しいファイルに書き直さないため
@@ -270,6 +334,8 @@ async function openFile($, id, carry = false) {
   flushedSeq = 0;
   crossed = {};
   capped = false;
+  lastMainAt = null;
+  compactCount = 0;
   health = carry ? prev.health : { failures: 0, last: null };
   if (carry) crossed = prev.crossed;
   let text = null;
@@ -278,8 +344,9 @@ async function openFile($, id, carry = false) {
   } catch (err) {
     file = dir + "/" + id + "." + Date.now() + ".jsonl";
     noteFailure($, "記録の読み込み", err);
-    return;
+    return undefined;
   }
+  let effort;
   for (const row of parseRows(text ?? "")) {
     rows.push(row);
     bytes += rowBytes(row);
@@ -288,7 +355,13 @@ async function openFile($, id, carry = false) {
       crossed[key] = Math.max(crossed[key] ?? 0, row.line ?? 0);
     }
     if (row.t === "capped") capped = true;
+    if (row.t === "step" && !row.agentId) {
+      lastMainAt = row.at;
+      if (row.effort !== undefined) effort = row.effort;
+    }
+    if (row.t === "compact" && !row.agentId) compactCount++;
   }
+  return effort;
 }
 
 // 切り替え待ちのときだけ id を問い合わせ、変わっていれば新しいファイルに移る。
@@ -345,6 +418,11 @@ function recordStep($, e, r) {
       cacheWrite: u?.cache_creation_input_tokens ?? 0,
       advisor: advisor || undefined,
     });
+    if (!e.agentId) {
+      if (e.effort !== undefined) info.effort = e.effort;
+      lastMainAt = Date.now();
+      $.ui.invalidate("ui.render");
+    }
   } catch (err) {
     // 記録に失敗しても、モデルの応答はそのまま通す
     noteFailure($, "応答の記録", err);
@@ -602,6 +680,32 @@ function sorted(groups, scoreFn) {
   return Object.entries(groups).sort((a, b) => scoreFn(b[1]) - scoreFn(a[1]));
 }
 
+function band(Box, Text, columns) {
+  const den = info.threshold ?? ctx.window;
+  const pct = den ? Math.round((ctx.tokens / den) * 100) : 0;
+  const ctxColor = pct >= 90 ? "red" : pct >= 70 ? "yellow" : "green";
+
+  const head = [{ text: info.model.replace(/^claude-/, ""), bold: true }];
+  if (info.effort !== null) head.push({ text: String(info.effort), color: EFFORT_COLOR[info.effort] });
+  if (info.repoName) head.push({ text: info.repoName + (info.branch ? "@" + info.branch : "") });
+
+  const meter = [];
+  if (den) meter.push({ text: "ctx " + short(ctx.tokens) + "/" + short(den) + " (" + pct + "%)", color: ctxColor });
+  // 幅が狭くても落ちないよう、ctx の次に置く
+  if (health.failures || capped) meter.push({ text: "⚠ 記録", color: "yellow" });
+  for (const l of limits) {
+    const name = l.kind === "five_hour" ? "5h" : l.kind === "seven_day" ? "7d" : l.kind;
+    const pctUsed = Math.round(l.percentUsed);
+    const left = resetIn(l.resetsAt);
+    meter.push({ text: name + " " + pctUsed + "%" + (left ? " (" + left + ")" : ""), color: pctUsed >= 80 ? "red" : pctUsed >= 50 ? "yellow" : undefined, dim: pctUsed < 50 });
+    if (l.kind === "five_hour" && projected !== null) meter.push({ text: "→ 予測 " + projected + "%", color: "red" });
+  }
+  if (lastMainAt) meter.push({ text: "前回 " + (ago(lastMainAt) || "今"), dim: true });
+  meter.push({ text: "圧縮 " + compactCount, dim: true });
+
+  return Box({ flexDirection: "column", paddingX: 1, children: [line(Text, head, columns), line(Text, meter, columns)] });
+}
+
 // 5h 枠をこのままの速さで使うと、リセット時に何 % になるか。100% に届くときだけ返す。
 // 最初の観測から10分たつまでは、速さが当てにならないので出さない
 function projection(first, l, now) {
@@ -611,6 +715,34 @@ function projection(first, l, now) {
   if (!(rate > 0)) return null;
   const projected = Math.round(l.percentUsed + rate * (reset - now));
   return projected >= 100 ? projected : null;
+}
+
+// 幅に入らなければ後ろから落とす
+function line(Text, segments, columns) {
+  const sep = " · ";
+  while (segments.length > 1 && width(segments.map((s) => s.text).join(sep)) + 2 > columns) {
+    segments.pop();
+  }
+  const children = [];
+  segments.forEach((s, i) => {
+    if (i > 0) children.push(Text({ dimColor: true, children: [sep] }));
+    children.push(Text({ color: s.color, bold: s.bold, dimColor: s.dim, children: [s.text] }));
+  });
+  return Text({ children });
+}
+
+// statusline.sh と同じ色
+const EFFORT_COLOR = { low: "green", medium: "yellow", high: "cyan", xhigh: "magenta", max: "red" };
+
+// リセットまでの残り時間（statusline.sh と同じ書式: 3d17h / 4h25m / 12m）
+function resetIn(iso) {
+  if (!iso) return "";
+  return span(Math.floor((Date.parse(iso) - Date.now()) / 1000));
+}
+
+// 経過時間（同じ書式。1分未満は空）
+function ago(at) {
+  return span(Math.floor((Date.now() - at) / 1000));
 }
 
 function span(sec) {
@@ -631,4 +763,11 @@ function short(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1_000) return Math.round(n / 1_000) + "k";
   return String(n);
+}
+
+// 全角は2桁として数える
+function width(s) {
+  let w = 0;
+  for (const ch of s) w += /[　-鿿＀-￯]/.test(ch) ? 2 : 1;
+  return w;
 }
