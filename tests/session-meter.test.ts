@@ -7,10 +7,10 @@ const OTHER = '00000000-0000-0000-0000-000000000002'
 const DAY = 86_400_000
 
 type Files = Record<string, { text: string; mtimeMs?: number }>
-// 失敗させたい API。writeFailures は先頭から何回失敗させるか
+// APIs to make fail. writeFailures is how many of the first writes fail
 type Faults = { read?: boolean; readPaths?: string[]; list?: boolean; writeFailures?: number; usage?: boolean; noHome?: boolean }
 
-// session.start が呼ぶ API をまとめて差し替える。files は仮のファイルシステム（パス → 中身）
+// Stub every API session.start calls. files is a fake file system (path -> contents)
 function stubSession(on: any, files: Files = {}, faults: Faults = {}) {
   const written: string[] = []
   const runs: string[][] = []
@@ -110,7 +110,7 @@ async function metrics($: any, args = '') {
   return (await $.command.run({ command: 'metrics', args })).text as string
 }
 
-test('圧縮すると、turn.complete を待たずに compact の行が書かれる', async ($, on) => {
+test('a compaction writes its compact row without waiting for turn.complete', async ($, on) => {
   const { written } = stubSession(on)
   const MSGS = [{ role: 'user', text: 'hi', toolUses: [] }]
   on('session.compact', () => ({ messages: MSGS, tokensBefore: 290000, tokensAfter: 30000 }))
@@ -120,7 +120,7 @@ test('圧縮すると、turn.complete を待たずに compact の行が書かれ
   expect(lastRows(written).find((r) => r.t === 'compact')).toMatchObject({ trigger: 'auto', tokens: 290000, after: 30000, threshold: 320000 })
 })
 
-test('turn.step の結果は変えずに通す', async ($, on) => {
+test('turn.step passes its result through unchanged', async ($, on) => {
   stubSession(on)
   stubStep(on)
   await start($)
@@ -129,7 +129,7 @@ test('turn.step の結果は変えずに通す', async ($, on) => {
   expect(result.usage).toEqual(USAGE)
 })
 
-test('spawn と step を agentId で突き合わせて /metrics に出す', async ($, on) => {
+test('/metrics matches spawns and steps by agentId', async ($, on) => {
   stubSession(on)
   stubStep(on)
   on('agent.spawn', () => ({ model: 'claude-test', agentId: 'a1' }))
@@ -139,12 +139,12 @@ test('spawn と step を agentId で突き合わせて /metrics に出す', asyn
   await step($)
 
   const text = await metrics($)
-  expect(text).toContain('Explore [test]: 起動 1 回, 1回あたり 1k')
+  expect(text).toContain('Explore [test]: 1 spawn, 1k per spawn')
   expect(text).toContain('cache read 1k')
-  expect(text).toContain('advisor: メイン 1 回 / サブエージェント 1 回')
+  expect(text).toContain('advisor: main 1 / subagents 1')
 })
 
-test('読み込み直しでは start を重ねず reload の行を書く', async ($, on) => {
+test('a reload writes a reload row instead of another start row', async ($, on) => {
   const { written } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start', repo: 'repo' }]) } })
   await start($)
   await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
@@ -154,7 +154,7 @@ test('読み込み直しでは start を重ねず reload の行を書く', async
   expect(rows.at(-1)).toMatchObject({ t: 'reload' })
 })
 
-test('session.end で終了理由と長さを書く', async ($, on) => {
+test('session.end records the reason and duration', async ($, on) => {
   const { written } = stubSession(on)
   await start($)
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SID, resume: SID })
@@ -164,7 +164,7 @@ test('session.end で終了理由と長さを書く', async ($, on) => {
   expect(typeof end.durationMs).toBe('number')
 })
 
-test('tool.call は結果を変えずに通し、名前・時間・失敗を記録する', async ($, on) => {
+test('tool.call passes its result through and records name, time, and failure', async ($, on) => {
   const { clock } = stubSession(on)
   on('tool.call', async ($: any, e: any) => {
     await clock.sleep(1500)
@@ -177,10 +177,10 @@ test('tool.call は結果を変えずに通し、名前・時間・失敗を記�
   expect(r.text).toBe('boom')
 
   const text = await metrics($)
-  expect(text).toContain('Bash: 1 回（失敗 1）, 合計 1.5s')
+  expect(text).toContain('Bash: 1 call (1 failed), total 1.5s')
 })
 
-test('同じループの2回目以降で cacheWrite が cacheRead を上回ると、作り直しと数える', async ($, on) => {
+test('from the second request of a loop, cacheWrite above cacheRead counts as a rebuild', async ($, on) => {
   stubSession(on)
   stubStep(on, [
     { ...USAGE, cache_read_input_tokens: 0, cache_creation_input_tokens: 5000 },
@@ -192,10 +192,10 @@ test('同じループの2回目以降で cacheWrite が cacheRead を上回る�
   await step($)
   await step($)
 
-  expect(await metrics($)).toContain('（作り直し 1 回）')
+  expect(await metrics($)).toContain('(1 rebuild)')
 })
 
-test('/metrics 7d は期間内の行だけを、ほかのセッションの記録と合わせて数える', async ($, on) => {
+test('/metrics 7d counts only rows in the period, across other sessions', async ($, on) => {
   const now = Date.now()
   stubSession(on, {
     [DIR + '/' + OTHER + '.jsonl']: {
@@ -212,12 +212,12 @@ test('/metrics 7d は期間内の行だけを、ほかのセッションの記�
   await step($)
 
   const text = await metrics($, '7d')
-  expect(text).toContain('2 セッション')
-  expect(text).toContain('メインループ: 2 リクエスト, in 17 /')
-  expect(text).toContain('other-repo: 1 リクエスト')
+  expect(text).toContain('2 sessions')
+  expect(text).toContain('Main loop: 2 requests, in 17 /')
+  expect(text).toContain('other-repo: 1 request')
 })
 
-test('/metrics prune は古いファイルだけを絶対パスで消し、日数がなければ何もしない', async ($, on) => {
+test('/metrics prune deletes only old files by absolute path, and does nothing without days', async ($, on) => {
   const now = Date.now()
   const { runs } = stubSession(on, {
     [DIR + '/' + OTHER + '.jsonl']: { text: '{}\n', mtimeMs: now - 40 * DAY },
@@ -227,26 +227,26 @@ test('/metrics prune は古いファイルだけを絶対パスで消し、日�
   await start($)
   const before = runs.length
 
-  expect(await metrics($, 'prune')).toContain('使い方')
+  expect(await metrics($, 'prune')).toContain('Usage')
   expect(runs.length).toBe(before)
 
-  expect(await metrics($, 'prune 30d')).toContain('1 件')
+  expect(await metrics($, 'prune 30d')).toContain('Deleted 1 record file ')
   expect(runs.at(-1)).toEqual(['rm', '--', DIR + '/' + OTHER + '.jsonl'])
 })
 
-test('最初の応答より前でも、起動した時点で start 行が書き出される', async ($, on) => {
+test('the start row is written at startup, before the first response', async ($, on) => {
   const { written } = stubSession(on)
   await start($)
   expect(lastRows(written).map((r) => r.t)).toEqual(['start'])
 })
 
-test('読み込み直しでは、最後のメインの応答の effort を引き継ぐ', async ($, on) => {
+test('a reload takes effort from the last main-loop response', async ($, on) => {
   const { counts } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }, { at: 2, t: 'step', effort: 'max', in: 0, out: 0, cacheRead: 0, cacheWrite: 0 }]) } })
   await start($)
   expect(counts.settingsRead).toBe(0)
 })
 
-test('/clear のあとは、新しい session id のファイルに書く', async ($, on) => {
+test('after /clear, rows go to the file for the new session id', async ($, on) => {
   const { writes, id } = stubSession(on)
   stubStep(on)
   await start($)
@@ -263,7 +263,7 @@ test('/clear のあとは、新しい session id のファイルに書く', asyn
   expect(fresh.text).toContain('"t":"step"')
 })
 
-test('5h 枠がこの速さだとリセット前に 100% を超えるとき、pace の行を1回だけ書く', async ($, on) => {
+test('writes one pace row when the 5h limit would pass 100% before reset at this rate', async ($, on) => {
   const { written, clock } = stubSession(on)
   on('session.measure', () => ({ changed: ['rateLimits'] }))
   const resetsAt = new Date(clock.now() + 4 * 3_600_000).toISOString()
@@ -282,7 +282,7 @@ test('5h 枠がこの速さだとリセット前に 100% を超えるとき、pa
   expect(paces[0].projected).toBeGreaterThanOrEqual(100)
 })
 
-test('ゆっくり使っているときは pace の行を書かない', async ($, on) => {
+test('no pace row when usage is slow', async ($, on) => {
   const { written, clock } = stubSession(on)
   on('session.measure', () => ({ changed: ['rateLimits'] }))
   const resetsAt = new Date(clock.now() + 4 * 3_600_000).toISOString()
@@ -296,7 +296,7 @@ test('ゆっくり使っているときは pace の行を書かない', async ($
   expect(lastRows(written).some((r) => r.t === 'pace')).toBe(false)
 })
 
-test('/metrics 7d は、期間より前に起動したセッションのリポジトリ名とエージェントの種類も引ける', async ($, on) => {
+test('/metrics 7d resolves repo names and agent types for sessions started before the period', async ($, on) => {
   const now = Date.now()
   stubSession(on, {
     [DIR + '/' + OTHER + '.jsonl']: {
@@ -310,26 +310,26 @@ test('/metrics 7d は、期間より前に起動したセッションのリポ�
   })
   await start($)
   const text = await metrics($, '7d')
-  expect(text).toContain('old-repo: 1 リクエスト')
+  expect(text).toContain('old-repo: 1 request')
   expect(text).toContain('Plan [test]')
-  expect(text).not.toContain('(不明)')
+  expect(text).not.toContain('(unknown)')
 })
 
-test('記録ファイルが読めないと、元のファイルには書かず別名のファイルに書く', async ($, on) => {
+test('when the record file cannot be read, writes to a different file instead of the original', async ($, on) => {
   const { writes, calls } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }]) } }, { read: true })
   await start($)
   expect(writes.some((w) => w.path === DIR + '/' + SID + '.jsonl')).toBe(false)
   expect(writes.at(-1)!.path).toMatch(new RegExp('^' + DIR + '/' + SID + '\\.\\d+\\.jsonl$'))
-  expect(calls.logs.some((l) => l.includes('記録の読み込み'))).toBe(true)
+  expect(calls.logs.some((l) => l.includes('reading records'))).toBe(true)
 })
 
-test('壊れた行は、書き直したあとも残る', async ($, on) => {
+test('broken rows survive a rewrite', async ($, on) => {
   const { written } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: '{"at":1,"t":"start"}\n{not json\n' } })
   await start($)
   expect(lastRows(written).find((r) => r.t === 'broken')).toMatchObject({ raw: '{not json' })
 })
 
-test('書き出しに失敗しても、次の書き出しで同じ行を書く', async ($, on) => {
+test('after a failed write, the next write includes the same rows', async ($, on) => {
   const { written } = stubSession(on, {}, { writeFailures: 1 })
   stubStep(on)
   await start($)
@@ -338,7 +338,7 @@ test('書き出しに失敗しても、次の書き出しで同じ行を書く',
   expect(lastRows(written).map((r) => r.t)).toEqual(['start'])
 })
 
-test('3 MiB を超える前に記録を打ち切り、capped の行を1つだけ書く', async ($, on) => {
+test('stops recording before 3 MiB and writes a single capped row', async ($, on) => {
   const { written } = stubSession(on)
   on('tool.call', () => ({ ref: 1, result: {}, text: '' }))
   await start($)
@@ -350,7 +350,7 @@ test('3 MiB を超える前に記録を打ち切り、capped の行を1つだけ
   expect(written.at(-1)!.length).toBeLessThan(3 * 1024 * 1024)
 })
 
-test('/clear では git も usage も呼ばずに新しいファイルへ切り替える', async ($, on) => {
+test('/clear switches to the new file without calling git or usage', async ($, on) => {
   const { writes, id, calls } = stubSession(on, {}, {})
   await start($)
   const before = { usage: calls.usage, git: calls.git }
@@ -361,7 +361,7 @@ test('/clear では git も usage も呼ばずに新しいファイルへ切り�
   expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
 })
 
-test('/clear の前の書き出しが失敗しても、新しいファイルに切り替える', async ($, on) => {
+test('/clear switches to the new file even if the previous write failed', async ($, on) => {
   const { writes, id } = stubSession(on, {}, { writeFailures: 2 })
   await start($)
   id.value = OTHER
@@ -369,13 +369,13 @@ test('/clear の前の書き出しが失敗しても、新しいファイルに�
   expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
 })
 
-test('使用量が取れなくても、start 行を書き、帯のモデル名は入る', async ($, on) => {
+test('without usage, the start row is still written with the model name', async ($, on) => {
   const { written } = stubSession(on, {}, { usage: true })
   await start($)
   expect(lastRows(written)[0]).toMatchObject({ t: 'start', model: 'claude-test', repo: 'repo' })
 })
 
-test('HOME が無いときは何も書かない', async ($, on) => {
+test('writes nothing when HOME is not set', async ($, on) => {
   const { writes, calls } = stubSession(on, {}, { noHome: true })
   stubStep(on)
   await start($)
@@ -385,7 +385,7 @@ test('HOME が無いときは何も書かない', async ($, on) => {
   expect(calls.logs.some((l) => l.includes('HOME'))).toBe(true)
 })
 
-test('/clear を2回しても、描き直しのタイマーは1つ', async ($, on) => {
+test('two /clears still leave a single redraw timer', async ($, on) => {
   const { id, clock, calls } = stubSession(on)
   await start($)
   id.value = OTHER
@@ -398,28 +398,28 @@ test('/clear を2回しても、描き直しのタイマーは1つ', async ($, o
   expect(calls.invalidate - before).toBe(1)
 })
 
-test('書き出しに失敗すると /metrics に失敗の回数と未保存の行数が出る', async ($, on) => {
+test('a failed write shows the failure count and unsaved rows in /metrics', async ($, on) => {
   stubSession(on, {}, { writeFailures: 1 })
   await start($)
-  expect(await metrics($)).toMatch(/記録の状態: 失敗 1 回（最後: 書き出しの失敗: [^）]*）、未保存 1 行/)
+  expect(await metrics($)).toMatch(/Recording: 1 failure \(last: writing records failed: [^)]*\), 1 row unsaved/)
 })
 
-test('失敗がなければ /metrics は「正常」', async ($, on) => {
+test('/metrics shows OK when nothing failed', async ($, on) => {
   stubSession(on)
   await start($)
-  expect(await metrics($)).toContain('記録の状態: 正常')
+  expect(await metrics($)).toContain('Recording: OK')
 })
 
-test('同じ失敗は transcript に1回だけ出し、2回目からは debug ログに回す', async ($, on) => {
+test('the same failure goes to the transcript once, then to the debug log', async ($, on) => {
   const { calls } = stubSession(on, {}, { writeFailures: 3 })
   await start($)
   await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
   await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
-  expect(calls.logs.filter((l) => l.includes('書き出しの失敗')).length).toBe(1)
-  expect(calls.debug.filter((l) => l.includes('書き出しの失敗')).length).toBe(2)
+  expect(calls.logs.filter((l) => l.includes('writing records failed')).length).toBe(1)
+  expect(calls.debug.filter((l) => l.includes('writing records failed')).length).toBe(2)
 })
 
-test('期間集計で読めないファイルがあっても、残りを集計して件数を出す', async ($, on) => {
+test('period summary skips unreadable files and reports how many', async ($, on) => {
   const now = Date.now()
   const bad = DIR + '/00000000-0000-0000-0000-000000000003.jsonl'
   stubSession(on, {
@@ -428,17 +428,17 @@ test('期間集計で読めないファイルがあっても、残りを集計�
   }, { readPaths: [bad] })
   await start($)
   const text = await metrics($, '7d')
-  expect(text).toContain('メインループ: 1 リクエスト')
-  expect(text).toContain('読めなかった記録ファイル: 1 件')
+  expect(text).toContain('Main loop: 1 request')
+  expect(text).toContain('Unreadable record files: 1')
 })
 
-test('/metrics の処理が失敗しても、理由を答える', async ($, on) => {
+test('/metrics replies with the reason when it fails', async ($, on) => {
   stubSession(on, { [DIR + '/' + OTHER + '.jsonl']: { text: '{}\n' } }, { list: true })
   await start($)
-  expect(await metrics($, '7d')).toContain('/metrics に失敗しました: ')
+  expect(await metrics($, '7d')).toContain('/metrics failed: ')
 })
 
-test('中断した応答はリクエスト数とトークンに入れず、中断の回数として出す', async ($, on) => {
+test('aborted responses are counted separately, not as requests or tokens', async ($, on) => {
   stubSession(on)
   let n = 0
   on('turn.step', async function* ($: any, e: any) {
@@ -449,20 +449,20 @@ test('中断した応答はリクエスト数とトークンに入れず、中�
   await step($)
   await step($)
   const text = await metrics($)
-  expect(text).toContain('メインループ: 1 リクエスト（ほかに中断 1 回）, in 10 /')
+  expect(text).toContain('Main loop: 1 request (+1 aborted), in 10 /')
 })
 
-test('圧縮前のトークン数が取れなかったときは ? と出す', async ($, on) => {
+test('shows ? when tokens before compaction are unknown', async ($, on) => {
   stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }, { at: 2, t: 'compact', trigger: 'manual', tokens: null, after: 18000 }]) } })
   await start($)
   expect(await metrics($)).toContain('?→18k manual')
 })
 
-test('session.end の時点で id がまだ古くても、次の応答から新しいファイルに書く', async ($, on) => {
+test('writes to the new file from the next response even if session.end still sees the old id', async ($, on) => {
   const { writes, id } = stubSession(on)
   stubStep(on)
   await start($)
-  // 実機では session.end の中ではまだ古い id が返り、次のターンまでに変わる
+  // On a real machine session.end still returns the old id; it changes by the next turn
   await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
   id.value = OTHER
   await step($)
@@ -476,18 +476,18 @@ test('session.end の時点で id がまだ古くても、次の応答から新�
   expect(fresh.text).toContain('"t":"step"')
 })
 
-test('切り替えの前に前のファイルへ書き出し、それでも書けなければ失った行数を残す', async ($, on) => {
-  // 起動時・session.end・切り替え前の3回の書き出しが失敗する
+test('flushes the old file before switching, and records lost rows if that fails', async ($, on) => {
+  // The writes at startup, in session.end, and before the switch all fail
   const { writes, id } = stubSession(on, {}, { writeFailures: 3 })
   await start($)
   await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
   id.value = OTHER
   const text = await metrics($)
   expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
-  expect(text).toContain('前のセッションの記録の失敗: 2 行を書き出せずに失いました')
+  expect(text).toContain("writing the previous session's records failed: lost 2 rows that could not be written")
 })
 
-test('切り替え前に1回書ければ、前のセッションの行は前のファイルに残る', async ($, on) => {
+test('if the write before switching succeeds, the old rows stay in the old file', async ($, on) => {
   const { writes, id } = stubSession(on, {}, { writeFailures: 2 })
   await start($)
   await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
@@ -497,7 +497,7 @@ test('切り替え前に1回書ければ、前のセッションの行は前の�
   expect(old.text).toContain('"t":"end"')
 })
 
-test('切り替え待ちのときは、ツールの記録も新しいファイルに入る', async ($, on) => {
+test('while a switch is pending, tool rows go to the new file', async ($, on) => {
   const { writes, id } = stubSession(on)
   on('tool.call', () => ({ ref: 1, result: {}, text: 'ok', isError: false }))
   await start($)
@@ -511,7 +511,7 @@ test('切り替え待ちのときは、ツールの記録も新しいファイ�
   expect(fresh.text).toContain('"t":"tool"')
 })
 
-test('/clear のあと、すでに越えた利用枠の線を新しいファイルに書き直さない', async ($, on) => {
+test('after /clear, rate-limit lines already crossed are not written again', async ($, on) => {
   const { writes, id, clock } = stubSession(on)
   on('session.measure', () => ({ changed: ['rateLimits'] }))
   const resetsAt = new Date(clock.now() + 4 * 3_600_000).toISOString()
@@ -526,7 +526,7 @@ test('/clear のあと、すでに越えた利用枠の線を新しいファイ�
   expect(fresh.text).not.toContain('"t":"ratelimit"')
 })
 
-test('null や数値の行があっても読み込みを止めず、壊れた行として残す', async ($, on) => {
+test('null or number rows do not stop loading and are kept as broken rows', async ($, on) => {
   const { written } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }]) + 'null\n42\n' + jsonl([{ at: 2, t: 'step', in: 1, out: 1, cacheRead: 0, cacheWrite: 0 }]) } })
   await start($)
   const rows = lastRows(written)
@@ -534,14 +534,14 @@ test('null や数値の行があっても読み込みを止めず、壊れた行
   expect(rows.some((r) => r.t === 'step')).toBe(true)
 })
 
-// 帯を端末に描かせて、出ている文字を返す
+// Render the band in the terminal and return its text
 async function bandText($: any) {
   const ui = await $.ui.mount({ plugin: 'session-meter', surface: 'terminal', component: 'AbovePrompt', props: { bodyColumns: 200 } as any })
   const found = await ui.findAll({ type: 'Text' })
   return found.map((f: any) => f.text).join(' ')
 }
 
-test('帯: 通常はモデル名と ctx を出す', async ($, on) => {
+test('band: shows the model name and ctx', async ($, on) => {
   stubSession(on)
   await start($)
   const text = await bandText($)
@@ -549,13 +549,13 @@ test('帯: 通常はモデル名と ctx を出す', async ($, on) => {
   expect(text).toMatch(/ctx \d/)
 })
 
-test('帯: モデル名が取れなくても、記録の失敗があれば ⚠ 記録 を出す', async ($, on) => {
+test('band: shows ⚠ recording on failures even without a model name', async ($, on) => {
   stubSession(on, {}, { noHome: true })
   await start($)
-  expect(await bandText($)).toContain('⚠ 記録')
+  expect(await bandText($)).toContain('⚠ recording')
 })
 
-test('帯: /clear の直後は、次の計測まで ctx を ? と出す', async ($, on) => {
+test('band: right after /clear, shows ctx ? until the next measurement', async ($, on) => {
   const { id } = stubSession(on)
   on('session.measure', () => ({ changed: ['context'] }))
   await start($)

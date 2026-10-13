@@ -1,0 +1,12 @@
+{
+  "name": "s0ar-mods",
+  "description": "Claude Code mods by s0ar",
+  "owner": { "name": "s0ar" },
+  "plugins": [
+    {
+      "name": "session-meter",
+      "source": "./",
+      "description": "Records compactions, cache use, subagents, tool calls and rate limits per session, summarized with /metrics. Shows a band above the prompt with context against the autocompact threshold and rate limits."
+    }
+  ]
+}

@@ -1,20 +1,20 @@
-// session-meter: セッションの計測を JSONL に残し、プロンプトの上に2行出す。
+// session-meter: records per-session metrics to JSONL and draws two lines above the prompt.
 //
-// どの hook も記録するだけで、Claude Code の判断や入力は変えない。失敗した
-// hook は .catch で「無かったもの」にし、本来の動作をそのまま進める。
+// Every hook only records. None of them changes Claude Code's decisions or inputs. A hook
+// that fails is turned into "no hook" via .catch, so the original behavior carries on.
 //
-// 記録先は ~/.claude/mod-metrics/<session-id>.jsonl。行はメモリに溜め、
-// メインループの turn.complete と session.end でファイル全体を書き直す。
-// 保存するたびに module が読み込み直されるので、session.start でファイル
-// から行を読み戻す（圧縮の回数も行から数え直す）。
+// Records go to ~/.claude/mod-metrics/<session-id>.jsonl. Rows are kept in memory, and the
+// whole file is rewritten on the main loop's turn.complete and on session.end. The module
+// is reloaded on every save, so session.start reads the rows back from the file (and
+// recounts compactions from them).
 //
-// /metrics            このセッションの集計
-// /metrics 7d         直近7日の全セッションの集計
-// /metrics prune 30d  更新から30日を過ぎた記録ファイルを消す（手で呼んだときだけ）
+// /metrics            summary of this session
+// /metrics 7d         summary of all sessions in the last 7 days
+// /metrics prune 30d  delete record files not updated for 30 days (only when run by hand)
 
-// fs.read と fs.write は 4 MiB を超えると失敗するので、余裕を見て 3 MiB で記録を打ち切る
+// fs.read and fs.write fail above 4 MiB, so stop recording at 3 MiB to leave headroom
 const MAX_BYTES = 3 * 1024 * 1024;
-// <session-id>.jsonl と、読み込めなかったときの退避先 <session-id>.<時刻>.jsonl
+// <session-id>.jsonl, plus <session-id>.<time>.jsonl used when the original could not be read
 const FILE_NAME = /^[0-9a-f-]{36}(\.\d+)?\.jsonl$/;
 const DAY = 86_400_000;
 
@@ -22,33 +22,33 @@ let rows = [];
 let file = null;
 let dir = null;
 let sessionId = null;
-// 書き出す内容の大きさ（バイト）。push のたびに足す
+// Size in bytes of what will be written. Added to on every push
 let bytes = 0;
-// push のたびに増やす。書き出しの間に増えた行を取りこぼさないため
+// Incremented on every push, so rows added while a write is in flight are not lost
 let seq = 0;
 let flushedSeq = 0;
 let capped = false;
-// 「前回 Nm」を描き直すタイマーを動かしたか。/clear では module が続くので二重に動かさない
+// Whether the timer that redraws "last Nm" is running. The module survives /clear, so don't start it twice
 let ticking = false;
-// /clear・resume のあと、新しい session id へ切り替えるのを待っているか
+// Waiting to switch to the new session id after /clear or resume
 let switchPending = false;
-// 進行中の切り替え。複数の hook が同時に follow を呼んでも1回だけ切り替える
+// The switch in progress. Several hooks may call follow at once; switch only once
 let following = null;
-// 記録の失敗。/metrics と帯に出す。同じ内容のログは transcript に1回だけ出す
+// Recording failures, shown in /metrics and the band. The same log message goes to the transcript only once
 let health = { failures: 0, last: null };
 const logged = new Set();
 
-// 帯に出す値
+// Values shown in the band
 let info = { model: "", repoName: "", branch: "", effort: null, threshold: null, source: null };
 let ctx = { tokens: 0, window: 0 };
 let limits = [];
-// 利用枠ごとに、記録済みの一番高い 10 ポイント刻みの線
+// Per rate limit, the highest 10-point line already recorded
 let crossed = {};
-// 5h 枠のペース予測用。resetsAt ごとに、最初に見た時刻と使用率（メモリにだけ持つ）
+// For the 5h pace projection: per resetsAt, the first time and percentage seen (memory only)
 let pace = {};
-// 帯に出す予測（%）。100% に届かないときは null
+// Projection (%) shown in the band. null when it does not reach 100%
 let projected = null;
-// 帯の描画のたびに全行を走査しないよう、最後のメインの応答時刻と圧縮回数を持つ
+// Last main-loop response time and compaction count, so the band need not scan every row on each render
 let lastMainAt = null;
 let compactCount = 0;
 
@@ -81,28 +81,28 @@ export function register(on) {
       const ms = (await $.clock.now()) - started;
       push({ t: "tool", name: e.tool, agentId: e.agentId, ms, err: r.isError ? true : undefined, deny: r.deny ? true : undefined });
     } catch (err) {
-      // 記録に失敗しても、ツールの結果はそのまま返す
-      noteFailure($, "ツールの記録", err);
+      // Even if recording fails, return the tool result unchanged
+      noteFailure($, "recording a tool call", err);
     }
     return r;
   }).catch(fail);
 
   on("session.compact", async ($, e, next) => {
     await follow($);
-    // 結果に tokensBefore が無いときの予備。precompute では使わないので取らない
+    // Fallback for when the result has no tokensBefore. Not needed for precompute, so skip it there
     let before = null;
     if (e.trigger !== "precompute" && !e.agentId) {
       try {
         before = await $.session.usage();
       } catch (err) {
-        // 取れなくても圧縮は進める
-        noteFailure($, "圧縮前の使用量の取得", err);
+        // Let the compaction proceed anyway
+        noteFailure($, "reading usage before compaction", err);
       }
     }
     const r = await next(e);
     if (e.trigger !== "precompute" && !r.skip) {
       try {
-        // tokensBefore は core が記録しなかったときだけ無い。そのときはメインループに限り直前の計測で補う
+        // tokensBefore is missing only when core did not record it. Then, for the main loop only, use the last measurement
         const tokens = r.tokensBefore ?? before?.context?.tokens ?? null;
         push({ t: "compact", trigger: e.trigger, agentId: e.agentId, tokens, after: r.tokensAfter, threshold: info.threshold });
         if (!e.agentId) {
@@ -110,11 +110,11 @@ export function register(on) {
           if (r.tokensAfter != null) ctx.tokens = r.tokensAfter;
         }
         $.ui.invalidate("ui.render");
-        // /compact はターンではなく turn.complete が来ないので、ここで書き出す
+        // /compact is not a turn, so no turn.complete follows. Write here
         await flush($);
       } catch (err) {
-        // 記録に失敗しても、圧縮の結果はそのまま返す
-        noteFailure($, "圧縮の記録", err);
+        // Even if recording fails, return the compaction result unchanged
+        noteFailure($, "recording a compaction", err);
       }
     }
     return r;
@@ -149,7 +149,7 @@ export function register(on) {
   on("turn.complete", async ($, e, next) => {
     await follow($);
     const r = await next(e);
-    // サブエージェントだけが動いている間も書き出す（新しい行がなければ何もしない）
+    // Also write while only subagents are running (does nothing if there are no new rows)
     await flushSafely($);
     return r;
   }).catch(fail);
@@ -160,15 +160,15 @@ export function register(on) {
     try {
       await flush($);
     } catch (err) {
-      noteFailure($, "書き出し", err);
+      noteFailure($, "writing records", err);
     }
     const r = await next(e);
-    // /clear と resume ではプロセスが別の session id で続き、session.start は来ない。
-    // 記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる。
-    // session.end の時点では $.session.id() がまだ古い id を返すことがある（実機で確認）
-    // ので、印だけ付けて次の hook の最初に切り替える
+    // After /clear and resume the process continues under a different session id, and no
+    // session.start arrives. Without switching to the new id, the next session's rows would
+    // end up in the old file. Inside session.end, $.session.id() can still return the old id
+    // (confirmed on a real machine), so only set a flag here and switch at the start of the next hook
     if (e.reason === "clear" || e.reason === "resume") {
-      // 前のセッションの値を出し続けないよう、次の計測が来るまで ctx は不明にする
+      // Show ctx as unknown until the next measurement, rather than the previous session's value
       ctx = { tokens: null, window: ctx.window };
       lastMainAt = null;
       compactCount = 0;
@@ -196,7 +196,7 @@ export function register(on) {
   }).catch(($, e, next) => {
     if (next.error?.kind === "re-entry") return undefined;
     noteFailure($, "/metrics", next.error?.message ?? next.error?.kind);
-    return { text: "/metrics に失敗しました: " + (next.error?.message ?? next.error?.kind ?? "原因不明") };
+    return { text: "/metrics failed: " + (next.error?.message ?? next.error?.kind ?? "unknown error") };
   });
 
   on("ui.render", { component: "AbovePrompt" }, ($, e, next) => {
@@ -207,10 +207,10 @@ export function register(on) {
   }).catch(failRender);
 }
 
-const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（直近7日） / /metrics prune 30d（30日より前の記録ファイルを消す）";
+const USAGE = "Usage: /metrics (this session) / /metrics 7d (last 7 days) / /metrics prune 30d (delete record files older than 30 days)";
 
-// 失敗した hook は無かったものにする（undefined を返す）。re-entry は hook が走らなかった
-// だけで失敗ではないので数えない
+// Turn a failed hook into "no hook" (return undefined). re-entry only means the hook did not
+// run, which is not a failure, so it is not counted
 function fail($, e, next) {
   if (next.error?.kind !== "re-entry") {
     noteFailure($, "hook " + next.event, (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
@@ -218,16 +218,16 @@ function fail($, e, next) {
   return undefined;
 }
 
-// 帯の描画用。描き直しを頼むとまた失敗して描画が回り続けるので、数えるだけにする
+// For band rendering. Asking for a redraw would fail again and keep rendering in a loop, so only count it
 function failRender($, e, next) {
   if (next.error?.kind !== "re-entry") {
     health.failures++;
-    health.last = "hook ui.render の失敗: " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? "");
+    health.last = "hook ui.render failed: " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? "");
   }
   return undefined;
 }
 
-// turn.step 用。generator でなければならないので、下の結果をそのまま流す
+// For turn.step. It must be a generator, so pass the result from below through as is
 async function* failStream($, e, next) {
   if (next.error?.kind !== "re-entry") {
     noteFailure($, "hook turn.step", (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
@@ -235,10 +235,10 @@ async function* failStream($, e, next) {
   return yield* next(e);
 }
 
-// 記録の途中で失敗したことを数える。transcript に出すのは同じ内容の1回目だけで、
-// 2回目以降は debug ログに回す（毎ツール・毎ターン同じ行が並ばないように）
+// Count a recording failure. Only the first occurrence of a message goes to the transcript;
+// repeats go to the debug log (so the same line does not appear on every tool call and turn)
 function noteFailure($, where, err) {
-  const message = where + "の失敗: " + (err?.message ?? String(err));
+  const message = where + " failed: " + (err?.message ?? String(err));
   health.failures++;
   health.last = message;
   try {
@@ -250,29 +250,29 @@ function noteFailure($, where, err) {
     }
     $.ui.invalidate("ui.render");
   } catch {
-    // ログが出せなくても、数は /metrics に残る
+    // Even if logging fails, the count stays in /metrics
   }
 }
 
 async function setup($) {
   const home = await $.env.get("HOME");
   if (!home) {
-    // 相対パス（undefined/.claude/...）に書かないよう、記録先が決まらなければ何もしない
+    // Without a destination, do nothing, rather than writing to a relative path (undefined/.claude/...)
     file = null;
     dir = null;
-    noteFailure($, "準備", "HOME が取れないので記録しません");
+    noteFailure($, "setup", "HOME is not set, so nothing will be recorded");
     return;
   }
   dir = home + "/.claude/mod-metrics";
   const restoredEffort = await openFile($, await $.session.id());
 
   try {
-    await $.command.register({ name: "metrics", description: "計測の集計（引数なし: このセッション、7d: 直近7日、prune 30d: 古い記録を消す）" });
+    await $.command.register({ name: "metrics", description: "Session metrics (no args: this session, 7d: last 7 days, prune 30d: delete old records)" });
   } catch {
-    // 読み込み直しで登録済みのときもここに来る
+    // Also lands here on reload, when the command is already registered
   }
 
-  // ここから先は帯と start 行に出す値。1つ取れなくても、ほかは進める
+  // Values for the band and the start row from here on. If one is unavailable, carry on with the rest
   try {
     const usage = await $.session.usage({ breakdown: "summary" });
     info.threshold = usage.context?.breakdown?.autoCompactThreshold ?? null;
@@ -280,15 +280,15 @@ async function setup($) {
     ctx = { tokens: usage.context?.tokens ?? 0, window: usage.context?.window ?? 0 };
     limits = usage.rateLimits ?? [];
   } catch (err) {
-    noteFailure($, "使用量の取得", err);
+    noteFailure($, "reading usage", err);
   }
   try {
     info.model = await $.session.model();
   } catch (err) {
-    noteFailure($, "モデル名の取得", err);
+    noteFailure($, "reading the model name", err);
   }
-  // effort はセッション単位で読む API がないので、最初の応答までは settings の値を出す。
-  // 応答が来たら turn.step の e.effort（/effort での変更も反映される）で上書きする
+  // There is no API to read effort per session, so show the settings value until the first
+  // response. Once a response arrives, turn.step's e.effort (which reflects /effort) replaces it
   if (restoredEffort !== undefined) {
     info.effort = restoredEffort;
   } else {
@@ -296,28 +296,28 @@ async function setup($) {
       const settings = await $.settings.read();
       info.effort = settings.modelSettings?.[info.model]?.effortLevel ?? settings.effortLevel ?? null;
     } catch (err) {
-      noteFailure($, "settings の読み込み", err);
+      noteFailure($, "reading settings", err);
     }
   }
   try {
     const repo = await $.session.repo();
     info.repoName = repo ? repo.root.split("/").pop() : "";
   } catch (err) {
-    noteFailure($, "リポジトリの取得", err);
+    noteFailure($, "reading the repository", err);
   }
   info.branch = "";
   try {
     const r = await $.process.run(["git", "branch", "--show-current"], { timeoutMs: 3000 });
     if (r.exitCode === 0) info.branch = r.stdout.trim();
   } catch {
-    // git がない、リポジトリ外など。失敗ではない
+    // No git, outside a repository, etc. Not a failure
   }
 
   markStart();
-  // 最初の応答より前に読み込み直されても start 行が残るよう、ここで書き出す
+  // Write now, so the start row survives a reload before the first response
   await flushSafely($);
 
-  // 「前回 Nm」を進めるため、1分ごとに描き直す。読み込み直すと古いタイマーは host が取り消す
+  // Redraw every minute to advance "last Nm". On reload the host cancels the old timer
   if (!ticking) {
     ticking = true;
     $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
@@ -326,10 +326,11 @@ async function setup($) {
   $.ui.invalidate("ui.render");
 }
 
-// 記録先を id のファイルにし、あれば行を読み戻す。最後のメインの応答の effort を返す。
-// 読めなかったときは元のファイルを上書きしないよう、別名のファイルに書く
-// carry が true（/clear・resume の切り替え）のときは、失敗の数と利用枠の線越えを引き継ぐ。
-// 利用枠はセッションをまたいで続くので、越えた線を新しいファイルに書き直さないため
+// Point recording at the file for id and read its rows back if it exists. Returns the effort of
+// the last main-loop response. If the file cannot be read, write to a differently named file so
+// the original is not overwritten.
+// When carry is true (switching on /clear or resume), keep the failure count and the crossed
+// rate-limit lines. Rate limits span sessions, so lines already crossed are not written again
 async function openFile($, id, carry = false) {
   const prev = { health, crossed };
   sessionId = id;
@@ -349,7 +350,7 @@ async function openFile($, id, carry = false) {
     if (await $.fs.exists(file)) text = await $.fs.read(file);
   } catch (err) {
     file = dir + "/" + id + "." + Date.now() + ".jsonl";
-    noteFailure($, "記録の読み込み", err);
+    noteFailure($, "reading records", err);
     return undefined;
   }
   let effort;
@@ -370,8 +371,8 @@ async function openFile($, id, carry = false) {
   return effort;
 }
 
-// 切り替え待ちのときだけ id を問い合わせ、変わっていれば新しいファイルに移る。
-// session.end は 1.5 秒しかないので、git などは呼ばず前の値を使う
+// Only while a switch is pending, ask for the id and move to the new file if it changed.
+// session.end has only 1.5 s, so reuse the previous values instead of calling git and the like
 async function follow($) {
   if (!switchPending) return;
   following ??= switchFile($).finally(() => {
@@ -385,19 +386,19 @@ async function switchFile($) {
     const id = await $.session.id();
     if (!id || id === sessionId) return;
     switchPending = false;
-    // 前のセッションの残りを書いてから移る。書けなければ失った行数を残す
+    // Write out the rest of the previous session before moving. If that fails, record how many rows were lost
     await flushSafely($);
     const lost = seq - flushedSeq;
     await openFile($, id, true);
-    if (lost > 0) noteFailure($, "前のセッションの記録", lost + " 行を書き出せずに失いました");
+    if (lost > 0) noteFailure($, "writing the previous session's records", "lost " + count(lost, "row") + " that could not be written");
     markStart();
     await flushSafely($);
   } catch (err) {
-    noteFailure($, "記録先の切り替え", err);
+    noteFailure($, "switching the record file", err);
   }
 }
 
-// 読み込み直しでは start を重ねず、reload の行だけ残す
+// On reload, don't add another start row; leave only a reload row
 function markStart() {
   if (rows.some((r) => r.t === "start")) {
     push({ t: "reload" });
@@ -411,7 +412,7 @@ function recordStep($, e, r) {
     const u = r?.usage;
     const advisor = (r?.serverToolUses ?? []).filter((s) => s.name === "advisor").length;
     if (!u) {
-      // 中断した応答は usage が無い。0 トークンのリクエストとして数えないよう印を付ける
+      // An aborted response has no usage. Mark it so it is not counted as a zero-token request
       push({ t: "step", agentId: e.agentId, model: e.model, effort: e.effort, aborted: true, advisor: advisor || undefined });
     } else push({
       t: "step",
@@ -430,8 +431,8 @@ function recordStep($, e, r) {
       $.ui.invalidate("ui.render");
     }
   } catch (err) {
-    // 記録に失敗しても、モデルの応答はそのまま通す
-    noteFailure($, "応答の記録", err);
+    // Even if recording fails, pass the model's response through unchanged
+    noteFailure($, "recording a response", err);
   }
 }
 
@@ -451,7 +452,7 @@ function push(row) {
   seq++;
 }
 
-// 書けたときだけ「書き出し済み」にする。失敗したら次の書き出しで同じ行をもう一度書く
+// Mark rows as written only after the write succeeds. On failure, the next flush writes them again
 async function flush($) {
   if (!file || seq === flushedSeq) return;
   const upTo = seq;
@@ -463,11 +464,11 @@ async function flushSafely($) {
   try {
     await flush($);
   } catch (err) {
-    noteFailure($, "書き出し", err);
+    noteFailure($, "writing records", err);
   }
 }
 
-// JSON にしたときの UTF-8 のバイト数（改行を含む）
+// UTF-8 byte length of the row as JSON (including the newline)
 function rowBytes(row) {
   const json = JSON.stringify(row);
   let n = 1;
@@ -484,10 +485,10 @@ function parseRows(text) {
     if (!line.trim()) continue;
     try {
       const row = JSON.parse(line);
-      // null や数値の行は row.t で止まるので、壊れた行と同じに扱う
+      // null or number rows would break on row.t, so treat them like broken rows
       out.push(row && typeof row === "object" && !Array.isArray(row) ? row : { t: "broken", raw: line });
     } catch {
-      // 壊れた行も捨てずに残す。ファイル全体を書き直すときに消えないように
+      // Keep broken rows instead of dropping them, so rewriting the whole file does not erase them
       out.push({ t: "broken", raw: line });
     }
   }
@@ -499,7 +500,7 @@ function parseDays(arg) {
   return m && Number(m[1]) > 0 ? Number(m[1]) : null;
 }
 
-// 記録ファイルの一覧（名前が session id のものだけ）
+// Record files (only those named after a session id)
 async function metricFiles($) {
   if (!dir || !(await $.fs.exists(dir))) return [];
   const entries = await $.fs.list(dir);
@@ -509,20 +510,20 @@ async function metricFiles($) {
 async function period($, days) {
   const since = Date.now() - days * DAY;
   const all = [];
-  // 期間より前に起動したセッションやエージェントも、リポジトリ名と種類は引けるようにする
+  // Look up repository names and agent types even for sessions and agents started before the period
   const repoOf = {};
   const spawnOf = {};
   let unreadable = 0;
   const take = (list, sid) => {
     for (const row of list) {
-      if (row.t === "start") repoOf[sid] = row.repo || "(リポジトリ外)";
+      if (row.t === "start") repoOf[sid] = row.repo || "(no repo)";
       if (row.t === "spawn" && row.agentId) spawnOf[row.agentId] = row;
       if (row.at >= since) all.push({ ...row, sid });
     }
   };
   for (const f of await metricFiles($)) {
     const sid = f.name.slice(0, 36);
-    // いまのセッションは、まだ書き出していない行があるのでメモリから取る
+    // The current session may have unwritten rows, so take it from memory
     if (sid === sessionId) continue;
     if (f.mtimeMs < since) continue;
     try {
@@ -533,39 +534,39 @@ async function period($, days) {
   }
   take(rows, sessionId);
   const sessions = new Set(all.map((r) => r.sid)).size;
-  return "直近 " + days + " 日（" + sessions + " セッション）\n" + report(all, { byRepo: true, repoOf, spawnOf })
-    + (unreadable ? "\n読めなかった記録ファイル: " + unreadable + " 件" : "");
+  return "Last " + count(days, "day") + " (" + count(sessions, "session") + ")\n" + report(all, { byRepo: true, repoOf, spawnOf })
+    + (unreadable ? "\nUnreadable record files: " + unreadable : "");
 }
 
 async function prune($, arg) {
   const days = parseDays(arg);
   if (!days) return USAGE;
   const before = Date.now() - days * DAY;
-  // いまのセッションのファイル（退避先を含む）は消さない
+  // Never delete the current session's files (including fallback files)
   const old = (await metricFiles($)).filter((f) => f.mtimeMs < before && f.name.slice(0, 36) !== sessionId);
-  if (!old.length) return days + " 日より前の記録ファイルはありません";
+  if (!old.length) return "No record files older than " + count(days, "day");
   const r = await $.process.run(["rm", "--", ...old.map((f) => dir + "/" + f.name)], { timeoutMs: 10000 });
-  if (r.exitCode !== 0) return "削除に失敗しました: " + r.stderr.trim();
+  if (r.exitCode !== 0) return "Delete failed: " + r.stderr.trim();
   const bytes = old.reduce((a, f) => a + f.size, 0);
-  return days + " 日より前の記録ファイルを " + old.length + " 件（" + short(bytes) + "B）消しました";
+  return "Deleted " + count(old.length, "record file") + " older than " + count(days, "day") + " (" + short(bytes) + "B)";
 }
 
 function summary() {
   const all = rows.map((r) => ({ ...r, sid: sessionId }));
   const lines = [report(all, { rateLimits: true })];
-  lines.push("閾値: " + (info.threshold ? short(info.threshold) + "（" + info.source + "）" : "取得できず"));
-  if (capped) lines.push("記録は " + short(MAX_BYTES) + "B で打ち切り済み");
+  lines.push("Threshold: " + (info.threshold ? short(info.threshold) + " (" + info.source + ")" : "unavailable"));
+  if (capped) lines.push("Recording stopped at " + short(MAX_BYTES) + "B");
   const unsaved = seq - flushedSeq;
-  lines.push("記録の状態: " + (health.failures
-    ? "失敗 " + health.failures + " 回（最後: " + health.last + "）"
-    : "正常") + (unsaved ? "、未保存 " + unsaved + " 行" : ""));
-  lines.push("記録: " + (file ?? "(未設定)"));
+  lines.push("Recording: " + (health.failures
+    ? count(health.failures, "failure") + " (last: " + health.last + ")"
+    : "OK") + (unsaved ? ", " + count(unsaved, "row") + " unsaved" : ""));
+  lines.push("File: " + (file ?? "(none)"));
   return lines.join("\n");
 }
 
-// 行の配列（sid 付き）から集計を作る。このセッション用と期間集計で共通
+// Build a summary from rows (with sid). Shared by the per-session and per-period views
 function report(list, opts = {}) {
-  // 中断した応答はトークンが無いので、リクエスト数と合計から外して別に数える
+  // Aborted responses have no tokens, so keep them out of request counts and totals and count them separately
   const steps = list.filter((r) => r.t === "step" && !r.aborted);
   const aborted = list.filter((r) => r.t === "step" && r.aborted);
   const spawns = list.filter((r) => r.t === "spawn");
@@ -576,69 +577,70 @@ function report(list, opts = {}) {
 
   const comp = list.filter((r) => r.t === "compact" && isMain(r));
   const auto = comp.filter((c) => c.trigger === "auto").length;
-  lines.push("圧縮: " + comp.length + " 回" + (comp.length ? "（auto " + auto + " / manual " + (comp.length - auto) + "）" : ""));
+  lines.push("Compactions: " + comp.length + (comp.length ? " (auto " + auto + " / manual " + (comp.length - auto) + ")" : ""));
   if (comp.length && !opts.byRepo) {
-    // 取れなかった値は 0 ではなく ? と出す
+    // Show missing values as ?, not 0
     lines.push("  " + comp.map((c) => (c.tokens != null ? short(c.tokens) : "?") + (c.after != null ? "→" + short(c.after) : "") + " " + c.trigger).join(", "));
   }
 
   const rebuilt = rebuilds(list);
   const main = steps.filter(isMain);
   const abortedMain = aborted.filter(isMain).length;
-  lines.push("メインループ: " + main.length + " リクエスト" + (abortedMain ? "（ほかに中断 " + abortedMain + " 回）" : "") + ", " + fmt(sum(main)) + ", " + cacheText(main, rebuilt));
+  lines.push("Main loop: " + count(main.length, "request") + (abortedMain ? " (+" + abortedMain + " aborted)" : "") + ", " + fmt(sum(main)) + ", " + cacheText(main, rebuilt));
 
   if (opts.byRepo) {
     const repoOf = { ...opts.repoOf };
-    for (const r of list) if (r.t === "start") repoOf[r.sid] = r.repo || "(リポジトリ外)";
-    const byRepo = group(main, (r) => repoOf[r.sid] ?? "(不明)");
+    for (const r of list) if (r.t === "start") repoOf[r.sid] = r.repo || "(no repo)";
+    const byRepo = group(main, (r) => repoOf[r.sid] ?? "(unknown)");
     if (Object.keys(byRepo).length) {
-      lines.push("リポジトリ別（メインループ）:");
+      lines.push("By repository (main loop):");
       for (const [repo, l] of sorted(byRepo, (l) => total(sum(l)))) {
-        lines.push("  " + repo + ": " + l.length + " リクエスト, " + short(total(sum(l))) + " tokens");
+        lines.push("  " + repo + ": " + count(l.length, "request") + ", " + short(total(sum(l))) + " tokens");
       }
     }
   }
 
-  // エージェントの種類とモデルごと
-  const keyOf = (s) => (s.type ?? "(不明)") + (s.model ? " [" + s.model.replace(/^claude-/, "") + "]" : "");
-  const byKey = group(steps.filter((r) => r.agentId), (r) => (spawnOf[r.agentId] ? keyOf(spawnOf[r.agentId]) : "(不明)"));
+  // Per agent type and model
+  const keyOf = (s) => (s.type ?? "(unknown)") + (s.model ? " [" + s.model.replace(/^claude-/, "") + "]" : "");
+  const byKey = group(steps.filter((r) => r.agentId), (r) => (spawnOf[r.agentId] ? keyOf(spawnOf[r.agentId]) : "(unknown)"));
   const counts = {};
   for (const s of spawns) counts[keyOf(s)] = (counts[keyOf(s)] ?? 0) + 1;
   const keys = Object.keys({ ...byKey, ...counts });
   if (keys.length) {
-    lines.push("サブエージェント:");
+    lines.push("Subagents:");
     for (const key of keys.sort((a, b) => total(sum(byKey[b] ?? [])) - total(sum(byKey[a] ?? [])))) {
       const l = byKey[key] ?? [];
       const n = counts[key] ?? 0;
-      const avg = n ? ", 1回あたり " + short(Math.round(total(sum(l)) / n)) : "";
-      lines.push("  " + key + ": 起動 " + n + " 回" + avg + ", " + fmt(sum(l)) + ", " + cacheText(l, rebuilt));
+      const avg = n ? ", " + short(Math.round(total(sum(l)) / n)) + " per spawn" : "";
+      lines.push("  " + key + ": " + count(n, "spawn") + avg + ", " + fmt(sum(l)) + ", " + cacheText(l, rebuilt));
     }
   }
 
   const adv = (l) => l.reduce((a, r) => a + (r.advisor ?? 0), 0);
-  lines.push("advisor: メイン " + adv(main) + " 回 / サブエージェント " + adv(steps.filter((r) => r.agentId)) + " 回");
+  lines.push("advisor: main " + adv(main) + " / subagents " + adv(steps.filter((r) => r.agentId)));
 
   const tools = list.filter((r) => r.t === "tool");
   if (tools.length) {
-    lines.push("ツール（合計時間の長い順、上位10）:");
+    lines.push("Tools (by total time, top 10):");
     for (const [name, l] of sorted(group(tools, (r) => r.name), (l) => l.reduce((a, r) => a + (r.ms ?? 0), 0)).slice(0, 10)) {
       const errs = l.filter((r) => r.err || r.deny).length;
-      lines.push("  " + name + ": " + l.length + " 回" + (errs ? "（失敗 " + errs + "）" : "") + ", 合計 " + duration(l.reduce((a, r) => a + (r.ms ?? 0), 0)));
+      lines.push("  " + name + ": " + count(l.length, "call") + (errs ? " (" + errs + " failed)" : "") + ", total " + duration(l.reduce((a, r) => a + (r.ms ?? 0), 0)));
     }
   }
 
   const broken = list.filter((r) => r.t === "broken").length;
-  if (broken) lines.push("壊れた行: " + broken + " 行（読み飛ばして集計）");
+  if (broken) lines.push("Broken rows: " + broken + " (skipped)");
 
   if (opts.rateLimits) {
     const rl = list.filter((r) => r.t === "ratelimit");
-    if (rl.length) lines.push("利用枠の線越え: " + rl.map((r) => r.kind + " " + r.line + "%").join(", "));
+    if (rl.length) lines.push("Rate limit lines crossed: " + rl.map((r) => r.kind + " " + r.line + "%").join(", "));
   }
   return lines.join("\n");
 }
 
-// cache を作り直したリクエスト。同じループ（セッションのメインか、サブエージェント）の
-// 2回目以降で、cacheWrite が cacheRead を上回ったもの。初回と圧縮直後は書き込むのが当然なので除く
+// Requests that rebuilt the cache: from the second request of the same loop (the session's main
+// loop or a subagent) on, those whose cacheWrite exceeds cacheRead. The first request and the one
+// right after a compaction are expected to write, so they are excluded
 function rebuilds(list) {
   const seen = new Set();
   const out = new Set();
@@ -659,7 +661,7 @@ function cacheText(steps, rebuilt) {
   const t = sum(steps);
   const input = t.in + t.cacheRead + t.cacheWrite;
   const n = steps.filter((r) => rebuilt.has(r)).length;
-  return "cache から " + (input ? Math.round((t.cacheRead / input) * 100) : 0) + "%" + (n ? "（作り直し " + n + " 回）" : "");
+  return (input ? Math.round((t.cacheRead / input) * 100) : 0) + "% from cache" + (n ? " (" + count(n, "rebuild") + ")" : "");
 }
 
 function sum(list) {
@@ -690,8 +692,8 @@ function band(Box, Text, lines, columns) {
   return Box({ flexDirection: "column", paddingX: 1, children: lines.map((segments) => line(Text, segments, columns)) });
 }
 
-// 帯の行（区切りごとの { text, color, bold, dim } の並び）。出すものが無ければ空。
-// モデル名が取れなくても、記録の失敗があれば2行目だけ出す（失敗に気づけるように）
+// Band lines (each a list of { text, color, bold, dim } segments). Empty when there is nothing to show.
+// Even without a model name, show the second line if recording failed (so the failure is noticed)
 function bandLines() {
   if (!info.model && !health.failures && !capped) return [];
   const den = info.threshold ?? ctx.window;
@@ -711,23 +713,23 @@ function bandLines() {
   if (den) {
     meter.push(known ? { text: "ctx " + short(ctx.tokens) + "/" + short(den) + " (" + pct + "%)", color: ctxColor } : { text: "ctx ?/" + short(den), dim: true });
   }
-  // 幅が狭くても落ちないよう、ctx の次に置く
-  if (health.failures || capped) meter.push({ text: "⚠ 記録", color: "yellow" });
+  // Placed right after ctx so it survives on narrow terminals
+  if (health.failures || capped) meter.push({ text: "⚠ recording", color: "yellow" });
   for (const l of limits) {
     const name = l.kind === "five_hour" ? "5h" : l.kind === "seven_day" ? "7d" : l.kind;
     const pctUsed = Math.round(l.percentUsed);
     const left = resetIn(l.resetsAt);
     meter.push({ text: name + " " + pctUsed + "%" + (left ? " (" + left + ")" : ""), color: pctUsed >= 80 ? "red" : pctUsed >= 50 ? "yellow" : undefined, dim: pctUsed < 50 });
-    if (l.kind === "five_hour" && projected !== null) meter.push({ text: "→ 予測 " + projected + "%", color: "red" });
+    if (l.kind === "five_hour" && projected !== null) meter.push({ text: "→ " + projected + "% at reset", color: "red" });
   }
-  if (lastMainAt) meter.push({ text: "前回 " + (ago(lastMainAt) || "今"), dim: true });
-  meter.push({ text: "圧縮 " + compactCount, dim: true });
+  if (lastMainAt) meter.push({ text: "last " + (ago(lastMainAt) || "now"), dim: true });
+  meter.push({ text: "compact " + compactCount, dim: true });
   lines.push(meter);
   return lines;
 }
 
-// 5h 枠をこのままの速さで使うと、リセット時に何 % になるか。100% に届くときだけ返す。
-// 最初の観測から10分たつまでは、速さが当てにならないので出さない
+// What % the 5h limit reaches at reset if usage continues at the current rate. Returned only when it
+// reaches 100%. Not shown until 10 minutes after the first observation, since the rate is unreliable before then
 function projection(first, l, now) {
   const reset = Date.parse(l.resetsAt);
   if (!(reset > now) || now - first.at < 600_000) return null;
@@ -737,7 +739,7 @@ function projection(first, l, now) {
   return projected >= 100 ? projected : null;
 }
 
-// 幅に入らなければ後ろから落とす
+// Drop segments from the end until the line fits
 function line(Text, segments, columns) {
   const sep = " · ";
   while (segments.length > 1 && width(segments.map((s) => s.text).join(sep)) + 2 > columns) {
@@ -751,16 +753,15 @@ function line(Text, segments, columns) {
   return Text({ children });
 }
 
-// statusline.sh と同じ色
 const EFFORT_COLOR = { low: "green", medium: "yellow", high: "cyan", xhigh: "magenta", max: "red" };
 
-// リセットまでの残り時間（statusline.sh と同じ書式: 3d17h / 4h25m / 12m）
+// Time left until reset (format: 3d17h / 4h25m / 12m)
 function resetIn(iso) {
   if (!iso) return "";
   return span(Math.floor((Date.parse(iso) - Date.now()) / 1000));
 }
 
-// 経過時間（同じ書式。1分未満は空）
+// Elapsed time (same format; empty under a minute)
 function ago(at) {
   return span(Math.floor((Date.now() - at) / 1000));
 }
@@ -779,13 +780,17 @@ function duration(ms) {
   return span(Math.floor(ms / 1000));
 }
 
+function count(n, word) {
+  return n + " " + word + (n === 1 ? "" : "s");
+}
+
 function short(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1_000) return Math.round(n / 1_000) + "k";
   return String(n);
 }
 
-// 全角は2桁として数える
+// Count full-width characters as two columns (repo and branch names may contain them)
 function width(s) {
   let w = 0;
   for (const ch of s) w += /[　-鿿＀-￯]/.test(ch) ? 2 : 1;

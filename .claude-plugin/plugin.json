@@ -1,6 +1,6 @@
 {
   "name": "session-meter",
-  "version": "0.2.2",
-  "description": "圧縮・リクエストごとの cache・サブエージェントの起動・advisor の経路・利用枠をセッションごとの JSONL に記録し、プロンプトの上に context（autocompact の閾値比）と利用枠を出す。",
+  "version": "0.3.0",
+  "description": "Records compactions, per-request cache use, subagent spawns, advisor calls and rate limits to a JSONL file per session, and shows context (relative to the autocompact threshold) and rate limits above the prompt.",
   "author": { "name": "s0ar" }
 }
