@@ -457,3 +457,21 @@ test('圧縮前のトークン数が取れなかったときは ? と出す', as
   await start($)
   expect(await metrics($)).toContain('?→18k manual')
 })
+
+test('session.end の時点で id がまだ古くても、次の応答から新しいファイルに書く', async ($, on) => {
+  const { writes, id } = stubSession(on)
+  stubStep(on)
+  await start($)
+  // 実機では session.end の中ではまだ古い id が返り、次のターンまでに変わる
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  await step($)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+
+  const old = writes.filter((w) => w.path.endsWith(SID + '.jsonl')).at(-1)!
+  const fresh = writes.filter((w) => w.path.endsWith(OTHER + '.jsonl')).at(-1)!
+  expect(old.text).toContain('"t":"end"')
+  expect(old.text).not.toContain('"t":"step"')
+  expect(fresh.text).toContain('"t":"start"')
+  expect(fresh.text).toContain('"t":"step"')
+})

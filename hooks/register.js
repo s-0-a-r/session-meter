@@ -30,6 +30,8 @@ let flushedSeq = 0;
 let capped = false;
 // 「前回 Nm」を描き直すタイマーを動かしたか。/clear では module が続くので二重に動かさない
 let ticking = false;
+// /clear・resume のあと、新しい session id へ切り替えるのを待っているか
+let switchPending = false;
 // 記録の失敗。/metrics と帯に出す。同じ内容のログは transcript に1回だけ出す
 let health = { failures: 0, last: null };
 const logged = new Set();
@@ -56,6 +58,7 @@ export function register(on) {
   }).catch(fail);
 
   on("turn.step", async function* ($, e, next) {
+    await follow($);
     const r = yield* next(e);
     recordStep($, e, r);
     return r;
@@ -81,6 +84,7 @@ export function register(on) {
   }).catch(fail);
 
   on("session.compact", async ($, e, next) => {
+    await follow($);
     // 結果に tokensBefore が無いときの予備。precompute では使わないので取らない
     let before = null;
     if (e.trigger !== "precompute" && !e.agentId) {
@@ -113,6 +117,7 @@ export function register(on) {
   }).catch(fail);
 
   on("session.measure", async ($, e, next) => {
+    await follow($);
     const now = await $.clock.now();
     ctx = { tokens: e.context?.tokens ?? 0, window: e.context?.window ?? 0 };
     limits = e.rateLimits ?? [];
@@ -138,6 +143,7 @@ export function register(on) {
   }).catch(fail);
 
   on("turn.complete", async ($, e, next) => {
+    await follow($);
     const r = await next(e);
     // サブエージェントだけが動いている間も書き出す（新しい行がなければ何もしない）
     await flushSafely($);
@@ -154,20 +160,18 @@ export function register(on) {
     }
     const r = await next(e);
     // /clear と resume ではプロセスが別の session id で続き、session.start は来ない。
-    // ここで記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる。
-    // session.end は core を含めて 1.5 秒しかないので、git などは呼ばず前の値を使う
+    // 記録先を新しい id に切り替えないと、次のセッションの行が古いファイルに混ざる。
+    // session.end の時点では $.session.id() がまだ古い id を返すことがある（実機で確認）
+    // ので、印だけ付けて次の hook の最初に切り替える
     if ((e.reason === "clear" || e.reason === "resume") && dir) {
-      const id = await $.session.id();
-      if (id !== sessionId) {
-        await openFile($, id);
-        markStart();
-        await flushSafely($);
-      }
+      switchPending = true;
+      await follow($);
     }
     return r;
   }).catch(fail);
 
   on("command.run", { command: "metrics" }, async ($, e) => {
+    await follow($);
     const args = (e.args ?? "").trim().split(/\s+/).filter(Boolean);
     if (args[0] === "prune") {
       return { text: await prune($, args[1]) };
@@ -344,6 +348,22 @@ async function openFile($, id) {
 }
 
 // 読み込み直しでは start を重ねず、reload の行だけ残す
+// 切り替え待ちのときだけ id を問い合わせ、変わっていれば新しいファイルに移る。
+// session.end は 1.5 秒しかないので、git などは呼ばず前の値を使う
+async function follow($) {
+  if (!switchPending) return;
+  try {
+    const id = await $.session.id();
+    if (!id || id === sessionId) return;
+    switchPending = false;
+    await openFile($, id);
+    markStart();
+    await flushSafely($);
+  } catch (err) {
+    noteFailure($, "記録先の切り替え", err);
+  }
+}
+
 function markStart() {
   if (rows.some((r) => r.t === "start")) {
     push({ t: "reload" });
