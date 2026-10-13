@@ -30,6 +30,9 @@ let flushedSeq = 0;
 let capped = false;
 // 「前回 Nm」を描き直すタイマーを動かしたか。/clear では module が続くので二重に動かさない
 let ticking = false;
+// 記録の失敗。/metrics と帯に出す。同じ内容のログは transcript に1回だけ出す
+let health = { failures: 0, last: null };
+const logged = new Set();
 
 // 帯に出す値
 let info = { model: "", repoName: "", branch: "", effort: null, threshold: null, source: null };
@@ -70,8 +73,9 @@ export function register(on) {
     try {
       const ms = (await $.clock.now()) - started;
       push({ t: "tool", name: e.tool, agentId: e.agentId, ms, err: r.isError ? true : undefined, deny: r.deny ? true : undefined });
-    } catch {
+    } catch (err) {
       // 記録に失敗しても、ツールの結果はそのまま返す
+      noteFailure($, "ツールの記録", err);
     }
     return r;
   }).catch(fail);
@@ -82,8 +86,9 @@ export function register(on) {
     if (e.trigger !== "precompute" && !e.agentId) {
       try {
         before = await $.session.usage();
-      } catch {
+      } catch (err) {
         // 取れなくても圧縮は進める
+        noteFailure($, "圧縮前の使用量の取得", err);
       }
     }
     const r = await next(e);
@@ -99,8 +104,9 @@ export function register(on) {
         $.ui.invalidate("ui.render");
         // /compact はターンではなく turn.complete が来ないので、ここで書き出す
         await flush($);
-      } catch {
+      } catch (err) {
         // 記録に失敗しても、圧縮の結果はそのまま返す
+        noteFailure($, "圧縮の記録", err);
       }
     }
     return r;
@@ -134,7 +140,7 @@ export function register(on) {
   on("turn.complete", async ($, e, next) => {
     const r = await next(e);
     // サブエージェントだけが動いている間も書き出す（新しい行がなければ何もしない）
-    await flush($);
+    await flushSafely($);
     return r;
   }).catch(fail);
 
@@ -172,7 +178,11 @@ export function register(on) {
       return { text: await period($, days) };
     }
     return { text: summary() };
-  }).catch(fail);
+  }).catch(($, e, next) => {
+    if (next.error?.kind === "re-entry") return undefined;
+    noteFailure($, "/metrics", next.error?.message ?? next.error?.kind);
+    return { text: "/metrics に失敗しました: " + (next.error?.message ?? next.error?.kind ?? "原因不明") };
+  });
 
   on("ui.render", { component: "AbovePrompt" }, ($, e, next) => {
     if (e.props?.hasSurvey || !info.model) {
@@ -185,21 +195,40 @@ export function register(on) {
 
 const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（直近7日） / /metrics prune 30d（30日より前の記録ファイルを消す）";
 
-// 失敗した hook は無かったものにする（undefined を返す）。理由だけ transcript に薄く残す
+// 失敗した hook は無かったものにする（undefined を返す）。re-entry は hook が走らなかった
+// だけで失敗ではないので数えない
 function fail($, e, next) {
-  $.ui.log("session-meter: " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
+  if (next.error?.kind !== "re-entry") {
+    noteFailure($, "hook " + next.event, (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
+  }
   return undefined;
-}
-
-// 記録の途中で失敗したことを残す
-function noteFailure($, where, err) {
-  $.ui.log("session-meter: " + where + " に失敗: " + (err?.message ?? String(err)));
 }
 
 // turn.step 用。generator でなければならないので、下の結果をそのまま流す
 async function* failStream($, e, next) {
-  $.ui.log("session-meter: turn.step " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
+  if (next.error?.kind !== "re-entry") {
+    noteFailure($, "hook turn.step", (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
+  }
   return yield* next(e);
+}
+
+// 記録の途中で失敗したことを数える。transcript に出すのは同じ内容の1回目だけで、
+// 2回目以降は debug ログに回す（毎ツール・毎ターン同じ行が並ばないように）
+function noteFailure($, where, err) {
+  const message = where + "の失敗: " + (err?.message ?? String(err));
+  health.failures++;
+  health.last = message;
+  try {
+    if (logged.has(message)) {
+      $.ui.log("session-meter: " + message, { to: "debug" });
+    } else {
+      logged.add(message);
+      $.ui.log("session-meter: " + message);
+    }
+    $.ui.invalidate("ui.render");
+  } catch {
+    // ログが出せなくても、数は /metrics に残る
+  }
 }
 
 async function setup($) {
@@ -287,6 +316,7 @@ async function openFile($, id) {
   capped = false;
   lastMainAt = null;
   compactCount = 0;
+  health = { failures: 0, last: null };
   let text = null;
   try {
     if (await $.fs.exists(file)) text = await $.fs.read(file);
@@ -342,8 +372,9 @@ function recordStep($, e, r) {
       lastMainAt = Date.now();
       $.ui.invalidate("ui.render");
     }
-  } catch {
+  } catch (err) {
     // 記録に失敗しても、モデルの応答はそのまま通す
+    noteFailure($, "応答の記録", err);
   }
 }
 
@@ -422,6 +453,7 @@ async function period($, days) {
   // 期間より前に起動したセッションやエージェントも、リポジトリ名と種類は引けるようにする
   const repoOf = {};
   const spawnOf = {};
+  let unreadable = 0;
   const take = (list, sid) => {
     for (const row of list) {
       if (row.t === "start") repoOf[sid] = row.repo || "(リポジトリ外)";
@@ -434,11 +466,16 @@ async function period($, days) {
     // いまのセッションは、まだ書き出していない行があるのでメモリから取る
     if (sid === sessionId) continue;
     if (f.mtimeMs < since) continue;
-    take(parseRows(await $.fs.read(dir + "/" + f.name)), sid);
+    try {
+      take(parseRows(await $.fs.read(dir + "/" + f.name)), sid);
+    } catch {
+      unreadable++;
+    }
   }
   take(rows, sessionId);
   const sessions = new Set(all.map((r) => r.sid)).size;
-  return "直近 " + days + " 日（" + sessions + " セッション）\n" + report(all, { byRepo: true, repoOf, spawnOf });
+  return "直近 " + days + " 日（" + sessions + " セッション）\n" + report(all, { byRepo: true, repoOf, spawnOf })
+    + (unreadable ? "\n読めなかった記録ファイル: " + unreadable + " 件" : "");
 }
 
 async function prune($, arg) {
@@ -459,6 +496,10 @@ function summary() {
   const lines = [report(all, { rateLimits: true })];
   lines.push("閾値: " + (info.threshold ? short(info.threshold) + "（" + info.source + "）" : "取得できず"));
   if (capped) lines.push("記録は " + short(MAX_BYTES) + "B で打ち切り済み");
+  const unsaved = seq - flushedSeq;
+  lines.push("記録の状態: " + (health.failures
+    ? "失敗 " + health.failures + " 回（最後: " + health.last + "）"
+    : "正常") + (unsaved ? "、未保存 " + unsaved + " 行" : ""));
   lines.push("記録: " + (file ?? "(未設定)"));
   return lines.join("\n");
 }
@@ -522,6 +563,9 @@ function report(list, opts = {}) {
       lines.push("  " + name + ": " + l.length + " 回" + (errs ? "（失敗 " + errs + "）" : "") + ", 合計 " + duration(l.reduce((a, r) => a + (r.ms ?? 0), 0)));
     }
   }
+
+  const broken = list.filter((r) => r.t === "broken").length;
+  if (broken) lines.push("壊れた行: " + broken + " 行（読み飛ばして集計）");
 
   if (opts.rateLimits) {
     const rl = list.filter((r) => r.t === "ratelimit");
@@ -590,6 +634,8 @@ function band(Box, Text, columns) {
 
   const meter = [];
   if (den) meter.push({ text: "ctx " + short(ctx.tokens) + "/" + short(den) + " (" + pct + "%)", color: ctxColor });
+  // 幅が狭くても落ちないよう、ctx の次に置く
+  if (health.failures) meter.push({ text: "⚠ 記録", color: "yellow" });
   for (const l of limits) {
     const name = l.kind === "five_hour" ? "5h" : l.kind === "seven_day" ? "7d" : l.kind;
     const pctUsed = Math.round(l.percentUsed);

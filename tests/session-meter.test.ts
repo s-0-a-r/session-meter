@@ -8,7 +8,7 @@ const DAY = 86_400_000
 
 type Files = Record<string, { text: string; mtimeMs?: number }>
 // 失敗させたい API。writeFailures は先頭から何回失敗させるか
-type Faults = { read?: boolean; writeFailures?: number; usage?: boolean; noHome?: boolean }
+type Faults = { read?: boolean; readPaths?: string[]; list?: boolean; writeFailures?: number; usage?: boolean; noHome?: boolean }
 
 // session.start が呼ぶ API をまとめて差し替える。files は仮のファイルシステム（パス → 中身）
 function stubSession(on: any, files: Files = {}, faults: Faults = {}) {
@@ -21,7 +21,7 @@ function stubSession(on: any, files: Files = {}, faults: Faults = {}) {
   on('session.id', () => ({ value: id.value }))
   on('session.model', () => ({ value: 'claude-test' }))
   on('session.repo', () => ({ value: { root: '/work/repo', remote: null, internal: false } }))
-  const calls = { usage: 0, git: 0, invalidate: 0, logs: [] as string[] }
+  const calls = { usage: 0, git: 0, invalidate: 0, logs: [] as string[], debug: [] as string[] }
   on('session.usage', () => {
     calls.usage++
     if (faults.usage) throw new Error('usage unavailable')
@@ -41,14 +41,17 @@ function stubSession(on: any, files: Files = {}, faults: Faults = {}) {
   })
   on('fs.exists', ($: any, e: any) => ({ value: e.path === DIR ? Object.keys(files).length > 0 : e.path in files }))
   on('fs.read', ($: any, e: any) => {
-    if (faults.read) throw new Error('EACCES: permission denied')
+    if (faults.read || faults.readPaths?.includes(e.path)) throw new Error('EACCES: permission denied')
     return { value: files[e.path]?.text ?? '' }
   })
-  on('fs.list', ($: any, e: any) => ({
+  on('fs.list', ($: any, e: any) => {
+    if (faults.list) throw new Error('EIO: i/o error')
+    return {
     value: Object.entries(files)
       .filter(([p]) => p.startsWith(e.path + '/'))
       .map(([p, f]) => ({ name: p.slice(e.path.length + 1), kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs ?? Date.now(), isLink: false })),
-  }))
+    }
+  })
   const writes: { path: string; text: string }[] = []
   let writeFailures = faults.writeFailures ?? 0
   on('fs.write', ($: any, e: any) => {
@@ -62,7 +65,8 @@ function stubSession(on: any, files: Files = {}, faults: Faults = {}) {
   })
   on('command.register', () => ({ value: undefined }))
   on('ui.log', ($: any, e: any) => {
-    calls.logs.push(e.text)
+    if (e.to === 'debug') calls.debug.push(e.text)
+    else calls.logs.push(e.text)
     return { value: undefined }
   })
   on('ui.invalidate', () => {
@@ -392,4 +396,44 @@ test('/clear を2回しても、描き直しのタイマーは1つ', async ($, o
   const before = calls.invalidate
   await clock.advance(60_000)
   expect(calls.invalidate - before).toBe(1)
+})
+
+test('書き出しに失敗すると /metrics に失敗の回数と未保存の行数が出る', async ($, on) => {
+  stubSession(on, {}, { writeFailures: 1 })
+  await start($)
+  expect(await metrics($)).toMatch(/記録の状態: 失敗 1 回（最後: 書き出しの失敗: [^）]*）、未保存 1 行/)
+})
+
+test('失敗がなければ /metrics は「正常」', async ($, on) => {
+  stubSession(on)
+  await start($)
+  expect(await metrics($)).toContain('記録の状態: 正常')
+})
+
+test('同じ失敗は transcript に1回だけ出し、2回目からは debug ログに回す', async ($, on) => {
+  const { calls } = stubSession(on, {}, { writeFailures: 3 })
+  await start($)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  expect(calls.logs.filter((l) => l.includes('書き出しの失敗')).length).toBe(1)
+  expect(calls.debug.filter((l) => l.includes('書き出しの失敗')).length).toBe(2)
+})
+
+test('期間集計で読めないファイルがあっても、残りを集計して件数を出す', async ($, on) => {
+  const now = Date.now()
+  const bad = DIR + '/00000000-0000-0000-0000-000000000003.jsonl'
+  stubSession(on, {
+    [DIR + '/' + OTHER + '.jsonl']: { text: jsonl([{ at: now - DAY, t: 'step', in: 7, out: 0, cacheRead: 0, cacheWrite: 0 }]) },
+    [bad]: { text: '{}\n' },
+  }, { readPaths: [bad] })
+  await start($)
+  const text = await metrics($, '7d')
+  expect(text).toContain('メインループ: 1 リクエスト')
+  expect(text).toContain('読めなかった記録ファイル: 1 件')
+})
+
+test('/metrics の処理が失敗しても、理由を答える', async ($, on) => {
+  stubSession(on, { [DIR + '/' + OTHER + '.jsonl']: { text: '{}\n' } }, { list: true })
+  await start($)
+  expect(await metrics($, '7d')).toContain('/metrics に失敗しました: ')
 })
