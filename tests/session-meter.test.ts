@@ -475,3 +475,61 @@ test('session.end の時点で id がまだ古くても、次の応答から新�
   expect(fresh.text).toContain('"t":"start"')
   expect(fresh.text).toContain('"t":"step"')
 })
+
+test('切り替えの前に前のファイルへ書き出し、それでも書けなければ失った行数を残す', async ($, on) => {
+  // 起動時・session.end・切り替え前の3回の書き出しが失敗する
+  const { writes, id } = stubSession(on, {}, { writeFailures: 3 })
+  await start($)
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  const text = await metrics($)
+  expect(writes.at(-1)!.path).toBe(DIR + '/' + OTHER + '.jsonl')
+  expect(text).toContain('前のセッションの記録の失敗: 2 行を書き出せずに失いました')
+})
+
+test('切り替え前に1回書ければ、前のセッションの行は前のファイルに残る', async ($, on) => {
+  const { writes, id } = stubSession(on, {}, { writeFailures: 2 })
+  await start($)
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  await metrics($)
+  const old = writes.filter((w) => w.path.endsWith(SID + '.jsonl')).at(-1)!
+  expect(old.text).toContain('"t":"end"')
+})
+
+test('切り替え待ちのときは、ツールの記録も新しいファイルに入る', async ($, on) => {
+  const { writes, id } = stubSession(on)
+  on('tool.call', () => ({ ref: 1, result: {}, text: 'ok', isError: false }))
+  await start($)
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  await $.tool.call({ tool: 'Bash', command: 'true' } as any)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  const old = writes.filter((w) => w.path.endsWith(SID + '.jsonl')).at(-1)!
+  const fresh = writes.filter((w) => w.path.endsWith(OTHER + '.jsonl')).at(-1)!
+  expect(old.text).not.toContain('"t":"tool"')
+  expect(fresh.text).toContain('"t":"tool"')
+})
+
+test('/clear のあと、すでに越えた利用枠の線を新しいファイルに書き直さない', async ($, on) => {
+  const { writes, id, clock } = stubSession(on)
+  on('session.measure', () => ({ changed: ['rateLimits'] }))
+  const resetsAt = new Date(clock.now() + 4 * 3_600_000).toISOString()
+  const measure = (pct: number) => $.session.measure({ context: { tokens: 1000, window: 1000000 }, rateLimits: [{ kind: 'five_hour', percentUsed: pct, resetsAt }], changed: ['rateLimits'] } as any)
+  await start($)
+  await measure(72)
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  await measure(73)
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, usage: null })
+  const fresh = writes.filter((w) => w.path.endsWith(OTHER + '.jsonl')).at(-1)!
+  expect(fresh.text).not.toContain('"t":"ratelimit"')
+})
+
+test('null や数値の行があっても読み込みを止めず、壊れた行として残す', async ($, on) => {
+  const { written } = stubSession(on, { [DIR + '/' + SID + '.jsonl']: { text: jsonl([{ at: 1, t: 'start' }]) + 'null\n42\n' + jsonl([{ at: 2, t: 'step', in: 1, out: 1, cacheRead: 0, cacheWrite: 0 }]) } })
+  await start($)
+  const rows = lastRows(written)
+  expect(rows.filter((r) => r.t === 'broken').map((r) => r.raw)).toEqual(['null', '42'])
+  expect(rows.some((r) => r.t === 'step')).toBe(true)
+})

@@ -32,6 +32,8 @@ let capped = false;
 let ticking = false;
 // /clear・resume のあと、新しい session id へ切り替えるのを待っているか
 let switchPending = false;
+// 進行中の切り替え。複数の hook が同時に follow を呼んでも1回だけ切り替える
+let following = null;
 // 記録の失敗。/metrics と帯に出す。同じ内容のログは transcript に1回だけ出す
 let health = { failures: 0, last: null };
 const logged = new Set();
@@ -65,12 +67,14 @@ export function register(on) {
   }).catch(failStream);
 
   on("agent.spawn", async ($, e, next) => {
+    await follow($);
     const r = await next(e);
     push({ t: "spawn", type: e.subagentType, agentId: r.agentId, model: r.model, denied: r.deny ? true : undefined });
     return r;
   }).catch(fail);
 
   on("tool.call", async ($, e, next) => {
+    await follow($);
     const started = await $.clock.now();
     const r = await next(e);
     try {
@@ -102,7 +106,7 @@ export function register(on) {
         const tokens = r.tokensBefore ?? before?.context?.tokens ?? null;
         push({ t: "compact", trigger: e.trigger, agentId: e.agentId, tokens, after: r.tokensAfter, threshold: info.threshold });
         if (!e.agentId) {
-          compactCount++;
+          if (rows.at(-1)?.t === "compact") compactCount++;
           if (r.tokensAfter != null) ctx.tokens = r.tokensAfter;
         }
         $.ui.invalidate("ui.render");
@@ -194,7 +198,7 @@ export function register(on) {
     }
     const { Box, Text } = $.ui.resolve(e);
     return band(Box, Text, e.props?.bodyColumns ?? 80);
-  }).catch(fail);
+  }).catch(failRender);
 }
 
 const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（直近7日） / /metrics prune 30d（30日より前の記録ファイルを消す）";
@@ -204,6 +208,15 @@ const USAGE = "使い方: /metrics（このセッション） / /metrics 7d（�
 function fail($, e, next) {
   if (next.error?.kind !== "re-entry") {
     noteFailure($, "hook " + next.event, (next.error?.kind ?? "error") + " " + (next.error?.message ?? ""));
+  }
+  return undefined;
+}
+
+// 帯の描画用。描き直しを頼むとまた失敗して描画が回り続けるので、数えるだけにする
+function failRender($, e, next) {
+  if (next.error?.kind !== "re-entry") {
+    health.failures++;
+    health.last = "hook ui.render の失敗: " + (next.error?.kind ?? "error") + " " + (next.error?.message ?? "");
   }
   return undefined;
 }
@@ -309,7 +322,10 @@ async function setup($) {
 
 // 記録先を id のファイルにし、あれば行を読み戻す。最後のメインの応答の effort を返す。
 // 読めなかったときは元のファイルを上書きしないよう、別名のファイルに書く
-async function openFile($, id) {
+// carry が true（/clear・resume の切り替え）のときは、失敗の数と利用枠の線越えを引き継ぐ。
+// 利用枠はセッションをまたいで続くので、越えた線を新しいファイルに書き直さないため
+async function openFile($, id, carry = false) {
+  const prev = { health, crossed };
   sessionId = id;
   file = dir + "/" + id + ".jsonl";
   rows = [];
@@ -320,7 +336,8 @@ async function openFile($, id) {
   capped = false;
   lastMainAt = null;
   compactCount = 0;
-  health = { failures: 0, last: null };
+  health = carry ? prev.health : { failures: 0, last: null };
+  if (carry) crossed = prev.crossed;
   let text = null;
   try {
     if (await $.fs.exists(file)) text = await $.fs.read(file);
@@ -347,16 +364,26 @@ async function openFile($, id) {
   return effort;
 }
 
-// 読み込み直しでは start を重ねず、reload の行だけ残す
 // 切り替え待ちのときだけ id を問い合わせ、変わっていれば新しいファイルに移る。
 // session.end は 1.5 秒しかないので、git などは呼ばず前の値を使う
 async function follow($) {
   if (!switchPending) return;
+  following ??= switchFile($).finally(() => {
+    following = null;
+  });
+  await following;
+}
+
+async function switchFile($) {
   try {
     const id = await $.session.id();
     if (!id || id === sessionId) return;
     switchPending = false;
-    await openFile($, id);
+    // 前のセッションの残りを書いてから移る。書けなければ失った行数を残す
+    await flushSafely($);
+    const lost = seq - flushedSeq;
+    await openFile($, id, true);
+    if (lost > 0) noteFailure($, "前のセッションの記録", lost + " 行を書き出せずに失いました");
     markStart();
     await flushSafely($);
   } catch (err) {
@@ -364,6 +391,7 @@ async function follow($) {
   }
 }
 
+// 読み込み直しでは start を重ねず、reload の行だけ残す
 function markStart() {
   if (rows.some((r) => r.t === "start")) {
     push({ t: "reload" });
@@ -449,7 +477,9 @@ function parseRows(text) {
   for (const line of String(text).split("\n")) {
     if (!line.trim()) continue;
     try {
-      out.push(JSON.parse(line));
+      const row = JSON.parse(line);
+      // null や数値の行は row.t で止まるので、壊れた行と同じに扱う
+      out.push(row && typeof row === "object" && !Array.isArray(row) ? row : { t: "broken", raw: line });
     } catch {
       // 壊れた行も捨てずに残す。ファイル全体を書き直すときに消えないように
       out.push({ t: "broken", raw: line });
@@ -662,7 +692,7 @@ function band(Box, Text, columns) {
   const meter = [];
   if (den) meter.push({ text: "ctx " + short(ctx.tokens) + "/" + short(den) + " (" + pct + "%)", color: ctxColor });
   // 幅が狭くても落ちないよう、ctx の次に置く
-  if (health.failures) meter.push({ text: "⚠ 記録", color: "yellow" });
+  if (health.failures || capped) meter.push({ text: "⚠ 記録", color: "yellow" });
   for (const l of limits) {
     const name = l.kind === "five_hour" ? "5h" : l.kind === "seven_day" ? "7d" : l.kind;
     const pctUsed = Math.round(l.percentUsed);
