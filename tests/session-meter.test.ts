@@ -565,3 +565,85 @@ test('band: right after /clear, shows ctx ? until the next measurement', async (
   await $.session.measure({ context: { tokens: 1000, window: 1000000 }, rateLimits: [], changed: ['context'] } as any)
   expect(await bandText($)).toMatch(/ctx 1/)
 })
+
+const STATUSLINE = { options: { display: 'statusline' } }
+
+// The status file is written without anyone waiting for it, so let it finish first
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+const plain = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, '')
+const statusWrites = (writes: { path: string; text: string }[]) => writes.filter((w) => w.path.endsWith('.status'))
+
+test('statusline: the band draws nothing and the status file gets both lines', STATUSLINE, async ($, on) => {
+  const { writes } = stubSession(on)
+  // What the engine draws when the plugin passes: a marker, so any band text would show up beside it
+  on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: ['engine default'] }))
+  await start($)
+  await settle()
+
+  expect(await bandText($)).toBe('engine default')
+  const status = statusWrites(writes).at(-1)!
+  expect(status.path).toBe(DIR + '/' + SID + '.status')
+  const lines = plain(status.text).split('\n')
+  expect(lines).toHaveLength(2)
+  expect(lines[0]).toBe('test · high · repo@main')
+  expect(lines[1]).toMatch(/^ctx 1k\/320k \(0%\) · compact 0$/)
+  expect(status.text).toContain('\x1b[1mtest\x1b[0m')
+})
+
+test('statusline: a burst of changes ends with the latest state in the file', STATUSLINE, async ($, on) => {
+  const { writes } = stubSession(on)
+  on('session.measure', () => ({ changed: ['context'] }))
+  await start($)
+  for (const tokens of [5000, 6000, 7000, 160000]) {
+    await $.session.measure({ context: { tokens, window: 1000000 }, rateLimits: [], changed: ['context'] } as any)
+  }
+  await settle()
+
+  expect(plain(statusWrites(writes).at(-1)!.text)).toContain('ctx 160k/320k (50%)')
+})
+
+test('statusline: after /clear, the next write goes to the new session id', STATUSLINE, async ($, on) => {
+  const { writes, id } = stubSession(on)
+  on('session.measure', () => ({ changed: ['context'] }))
+  await start($)
+  await $.session.end({ reason: 'clear', sessionId: SID, resume: SID })
+  id.value = OTHER
+  await $.session.measure({ context: { tokens: 1000, window: 1000000 }, rateLimits: [], changed: ['context'] } as any)
+  await settle()
+
+  expect(statusWrites(writes).at(-1)!.path).toBe(DIR + '/' + OTHER + '.status')
+})
+
+test('statusline: a failed status write is counted and shown in /metrics', STATUSLINE, async ($, on) => {
+  // The first write is the start row, the second is the status file
+  stubSession(on, {}, { writeFailures: 2 })
+  await start($)
+  await settle()
+
+  expect(await metrics($)).toContain('2 failures (last: writing the status file failed')
+})
+
+test('statusline: /metrics prune also deletes old status files, and /metrics 7d does not read them as records', STATUSLINE, async ($, on) => {
+  const now = Date.now()
+  const { runs } = stubSession(on, {
+    [DIR + '/' + OTHER + '.status']: { text: 'ctx 1k/320k', mtimeMs: now - 40 * DAY },
+    [DIR + '/00000000-0000-0000-0000-000000000003.status']: { text: 'ctx 1k/320k', mtimeMs: now - DAY },
+    [DIR + '/' + SID + '.status']: { text: 'ctx 1k/320k', mtimeMs: now - 40 * DAY },
+  })
+  await start($)
+
+  expect(await metrics($, '7d')).toContain('1 session)')
+  expect(await metrics($, 'prune 30d')).toContain('Deleted 1 record file ')
+  expect(runs.at(-1)).toEqual(['rm', '--', DIR + '/' + OTHER + '.status'])
+})
+
+test('band mode writes no status file', async ($, on) => {
+  const { writes } = stubSession(on)
+  on('session.measure', () => ({ changed: ['context'] }))
+  await start($)
+  await $.session.measure({ context: { tokens: 5000, window: 1000000 }, rateLimits: [], changed: ['context'] } as any)
+  await settle()
+
+  expect(statusWrites(writes)).toEqual([])
+  expect(await bandText($)).toContain('test')
+})

@@ -9,6 +9,23 @@ ctx 79k/287k (28%) · 5h 14% (1h50m) · 7d 16% (16h40m) · last 25m · compact 0
 
 The first line is the model, effort and repository. The second line shows context usage against the autocompact threshold (not the whole window), so you can see how close the next automatic compaction is. It also shows rate limit usage with time until reset, a projection when the 5-hour limit would run out before it resets, time since the last response, and the number of compactions in this session. `⚠ recording` appears if writing the records failed.
 
+## Showing the band in the status line
+
+The band can go to Claude Code's status line instead of above the prompt. Set the `display` option to `statusline` in the mod's config (the `/config` menu has a row for it). The default is `band`, and in that mode nothing below applies and no extra file is written.
+
+With `statusline`, nothing is drawn above the prompt. The same two lines are written, with ANSI colors, to `~/.claude/mod-metrics/<session-id>.status`. The file is rewritten whenever the band would redraw, and at least once a minute, so a file whose modification time is old belongs to a session that is not running. `/metrics prune` deletes old `.status` files by the same age rule as the record files.
+
+A status line script that prints it, assuming `jq` is installed:
+
+```sh
+#!/bin/sh
+sid=$(jq -r .session_id)
+f="$HOME/.claude/mod-metrics/$sid.status"
+[ -f "$f" ] && [ $(( $(date +%s) - $(stat -f %m "$f") )) -lt 180 ] && cat "$f"
+```
+
+`stat -f %m` is the macOS form. On Linux use `stat -c %Y`. Point `statusLine` in `settings.json` at the script (`"statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}`).
+
 ## What it records
 
 Each session is written to `~/.claude/mod-metrics/<session-id>.jsonl`:

@@ -1,6 +1,15 @@
 {
   "name": "session-meter",
-  "version": "0.3.0",
-  "description": "Records compactions, per-request cache use, subagent spawns, advisor calls and rate limits to a JSONL file per session, and shows context (relative to the autocompact threshold) and rate limits above the prompt.",
-  "author": { "name": "s0ar" }
+  "version": "0.4.0",
+  "description": "Records compactions, per-request cache use, subagent spawns, advisor calls and rate limits to a JSONL file per session, and shows context (relative to the autocompact threshold) and rate limits above the prompt, or in a file for your statusLine script with display=statusline.",
+  "author": { "name": "s0ar" },
+  "userConfig": {
+    "display": {
+      "type": "string",
+      "title": "Where to show the band",
+      "description": "band draws two lines above the prompt. statusline draws nothing there and writes the same lines to ~/.claude/mod-metrics/<session-id>.status for your statusLine script to print.",
+      "default": "band",
+      "options": ["band", "statusline"]
+    }
+  }
 }

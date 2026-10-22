@@ -1,4 +1,5 @@
-// session-meter: records per-session metrics to JSONL and draws two lines above the prompt.
+// session-meter: records per-session metrics to JSONL and draws two lines above the prompt,
+// or, with display=statusline, writes them to a file for a statusLine script to print.
 //
 // Every hook only records. None of them changes Claude Code's decisions or inputs. A hook
 // that fails is turned into "no hook" via .catch, so the original behavior carries on.
@@ -11,17 +12,27 @@
 // /metrics            summary of this session
 // /metrics 7d         summary of all sessions in the last 7 days
 // /metrics prune 30d  delete record files not updated for 30 days (only when run by hand)
+//
+// display=statusline writes the band's lines, as ANSI text, to ~/.claude/mod-metrics/<session-id>.status
+// and draws nothing above the prompt.
 
 // fs.read and fs.write fail above 4 MiB, so stop recording at 3 MiB to leave headroom
 const MAX_BYTES = 3 * 1024 * 1024;
 // <session-id>.jsonl, plus <session-id>.<time>.jsonl used when the original could not be read
 const FILE_NAME = /^[0-9a-f-]{36}(\.\d+)?\.jsonl$/;
+// Kept apart from FILE_NAME so that reading records never picks these up; only prune looks at both
+const STATUS_NAME = /^[0-9a-f-]{36}\.status$/;
 const DAY = 86_400_000;
 
 let rows = [];
 let file = null;
 let dir = null;
 let sessionId = null;
+// "band" draws above the prompt; "statusline" writes <session-id>.status instead
+let display = "band";
+// At most one status write in flight; statusDirty asks it to write once more with the latest state
+let statusBusy = false;
+let statusDirty = false;
 // Size in bytes of what will be written. Added to on every push
 let bytes = 0;
 // Incremented on every push, so rows added while a write is in flight are not lost
@@ -52,7 +63,9 @@ let projected = null;
 let lastMainAt = null;
 let compactCount = 0;
 
-export function register(on) {
+export function register(on, options) {
+  display = options?.display === "statusline" ? "statusline" : "band";
+
   on("session.start", async ($, e, next) => {
     const result = await next(e);
     await setup($);
@@ -109,7 +122,7 @@ export function register(on) {
           if (rows.at(-1)?.t === "compact") compactCount++;
           if (r.tokensAfter != null) ctx.tokens = r.tokensAfter;
         }
-        $.ui.invalidate("ui.render");
+        redraw($);
         // /compact is not a turn, so no turn.complete follows. Write here
         await flush($);
       } catch (err) {
@@ -142,7 +155,7 @@ export function register(on) {
         }
       }
     }
-    $.ui.invalidate("ui.render");
+    redraw($);
     return next(e);
   }).catch(fail);
 
@@ -172,7 +185,7 @@ export function register(on) {
       ctx = { tokens: null, window: ctx.window };
       lastMainAt = null;
       compactCount = 0;
-      $.ui.invalidate("ui.render");
+      redraw($);
       if (dir) {
         switchPending = true;
         await follow($);
@@ -200,6 +213,7 @@ export function register(on) {
   });
 
   on("ui.render", { component: "AbovePrompt" }, ($, e, next) => {
+    if (display === "statusline") return next(e);
     const lines = e.props?.hasSurvey ? [] : bandLines();
     if (!lines.length) return next(e);
     const { Box, Text } = $.ui.resolve(e);
@@ -237,7 +251,8 @@ async function* failStream($, e, next) {
 
 // Count a recording failure. Only the first occurrence of a message goes to the transcript;
 // repeats go to the debug log (so the same line does not appear on every tool call and turn)
-function noteFailure($, where, err) {
+// redrawAfter is false for a failed status write, which would otherwise retry itself forever
+function noteFailure($, where, err, redrawAfter = true) {
   const message = where + " failed: " + (err?.message ?? String(err));
   health.failures++;
   health.last = message;
@@ -248,10 +263,57 @@ function noteFailure($, where, err) {
       logged.add(message);
       $.ui.log("session-meter: " + message);
     }
-    $.ui.invalidate("ui.render");
+    if (redrawAfter) redraw($);
   } catch {
     // Even if logging fails, the count stays in /metrics
   }
+}
+
+// Every band change goes through here: redraw the band, or in statusline mode rewrite the file
+function redraw($) {
+  $.ui.invalidate("ui.render");
+  if (display === "statusline") writeStatus($);
+}
+
+// Fire and forget. The path is read on every pass, so after a session switch the next write
+// goes to the new id's file
+function writeStatus($) {
+  if (statusBusy) {
+    statusDirty = true;
+    return;
+  }
+  statusBusy = true;
+  (async () => {
+    try {
+      do {
+        statusDirty = false;
+        if (dir && sessionId) await $.fs.write(dir + "/" + sessionId + ".status", statusText());
+      } while (statusDirty);
+    } catch (err) {
+      noteFailure($, "writing the status file", err, false);
+    } finally {
+      statusBusy = false;
+    }
+  })();
+}
+
+function statusText() {
+  const sep = ansi("\x1b[2m", " · ");
+  return bandLines().map((segments) => segments.map((s) => ansi(sgr(s), s.text)).join(sep)).join("\n");
+}
+
+const ANSI_COLOR = { red: 31, green: 32, yellow: 33, magenta: 35, cyan: 36 };
+
+function sgr(s) {
+  const codes = [];
+  if (s.bold) codes.push(1);
+  if (s.dim) codes.push(2);
+  if (ANSI_COLOR[s.color]) codes.push(ANSI_COLOR[s.color]);
+  return codes.length ? "\x1b[" + codes.join(";") + "m" : "";
+}
+
+function ansi(start, text) {
+  return start ? start + text + "\x1b[0m" : text;
 }
 
 async function setup($) {
@@ -320,10 +382,10 @@ async function setup($) {
   // Redraw every minute to advance "last Nm". On reload the host cancels the old timer
   if (!ticking) {
     ticking = true;
-    $.clock.every(60_000, () => $.ui.invalidate("ui.render"));
+    $.clock.every(60_000, () => redraw($));
   }
 
-  $.ui.invalidate("ui.render");
+  redraw($);
 }
 
 // Point recording at the file for id and read its rows back if it exists. Returns the effort of
@@ -393,6 +455,7 @@ async function switchFile($) {
     if (lost > 0) noteFailure($, "writing the previous session's records", "lost " + count(lost, "row") + " that could not be written");
     markStart();
     await flushSafely($);
+    redraw($);
   } catch (err) {
     noteFailure($, "switching the record file", err);
   }
@@ -428,7 +491,7 @@ function recordStep($, e, r) {
     if (!e.agentId) {
       if (e.effort !== undefined) info.effort = e.effort;
       lastMainAt = Date.now();
-      $.ui.invalidate("ui.render");
+      redraw($);
     }
   } catch (err) {
     // Even if recording fails, pass the model's response through unchanged
@@ -500,11 +563,11 @@ function parseDays(arg) {
   return m && Number(m[1]) > 0 ? Number(m[1]) : null;
 }
 
-// Record files (only those named after a session id)
-async function metricFiles($) {
+// Files in the metrics directory whose name passes match. Record files by default (only those named after a session id)
+async function metricFiles($, match = (name) => FILE_NAME.test(name)) {
   if (!dir || !(await $.fs.exists(dir))) return [];
   const entries = await $.fs.list(dir);
-  return entries.filter((f) => f.kind === "file" && FILE_NAME.test(f.name));
+  return entries.filter((f) => f.kind === "file" && match(f.name));
 }
 
 async function period($, days) {
@@ -542,8 +605,8 @@ async function prune($, arg) {
   const days = parseDays(arg);
   if (!days) return USAGE;
   const before = Date.now() - days * DAY;
-  // Never delete the current session's files (including fallback files)
-  const old = (await metricFiles($)).filter((f) => f.mtimeMs < before && f.name.slice(0, 36) !== sessionId);
+  // Never delete the current session's files (including fallback and status files)
+  const old = (await metricFiles($, (name) => FILE_NAME.test(name) || STATUS_NAME.test(name))).filter((f) => f.mtimeMs < before && f.name.slice(0, 36) !== sessionId);
   if (!old.length) return "No record files older than " + count(days, "day");
   const r = await $.process.run(["rm", "--", ...old.map((f) => dir + "/" + f.name)], { timeoutMs: 10000 });
   if (r.exitCode !== 0) return "Delete failed: " + r.stderr.trim();
